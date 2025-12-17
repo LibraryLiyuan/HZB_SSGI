@@ -1,0 +1,38 @@
+﻿
+#include "/Engine/Public/Platform.ush"
+
+Texture2D InputDepthTexture;
+RWTexture2D<float> OutputDepthTexture;
+// mipmap中上一级的最大的像素边界
+float2 InputViewportMaxBound;
+// 当前纹理的尺寸
+float2 OutputViewportSize;
+
+// Compute Shader
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void HZBBuildCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadID.xy >= OutputViewportSize))
+	{
+		return; // 越界线程，直接杀死，不许读也不许写
+	}
+	uint2 DispathXYPos = DispatchThreadID.xy;
+	// 上一级mipmap对应的像素位置
+	uint2 SourcePos = DispathXYPos * 2;
+	// 向上取整，处理边界问题，15->8
+	uint2 MaxPos = (uint2)InputViewportMaxBound;
+
+	uint2 Pos00 = min(SourcePos + uint2(0,0), MaxPos);
+	uint2 Pos10 = min(SourcePos + uint2(1,0), MaxPos);
+	uint2 Pos01 = min(SourcePos + uint2(0,1), MaxPos);
+	uint2 Pos11 = min(SourcePos + uint2(1,1), MaxPos);
+
+	float D00 = InputDepthTexture.Load(int3(Pos00, 0)).r;
+	float D10 = InputDepthTexture.Load(int3(Pos10, 0)).r;
+	float D01 = InputDepthTexture.Load(int3(Pos01, 0)).r;
+	float D11 = InputDepthTexture.Load(int3(Pos11, 0)).r;
+
+	float MaxDepth = max(max(D00, D10), max(D01, D11));
+
+	OutputDepthTexture[DispathXYPos] = MaxDepth;
+}

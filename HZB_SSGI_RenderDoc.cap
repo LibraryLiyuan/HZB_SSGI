@@ -1,0 +1,28 @@
+{
+    "rdocCaptureSettings": 1,
+    "settings": {
+        "autoStart": false,
+        "commandLine": "\"D:/UE_Projects/HZB_SSGI/HZB_SSGI.uproject\"",
+        "environment": [
+        ],
+        "executable": "D:\\EpicEditors\\UE_5.6\\Engine\\Binaries\\Win64\\UnrealEditor.exe",
+        "inject": false,
+        "numQueuedFrames": 0,
+        "options": {
+            "allowFullscreen": true,
+            "allowVSync": true,
+            "apiValidation": false,
+            "captureAllCmdLists": false,
+            "captureCallstacks": false,
+            "captureCallstacksOnlyDraws": false,
+            "debugOutputMute": true,
+            "delayForDebugger": 0,
+            "hookIntoChildren": false,
+            "refAllResources": false,
+            "softMemoryLimit": 0,
+            "verifyBufferAccess": false
+        },
+        "queuedFrameCap": 0,
+        "workingDir": "D:/UE_Projects/HZB_SSGI"
+    }
+}
