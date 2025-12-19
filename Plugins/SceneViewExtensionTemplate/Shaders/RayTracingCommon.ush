@@ -1,0 +1,126 @@
+﻿#pragma once
+
+#include "/Engine/Private/Common.ush"
+
+struct FHiZTraceInput
+{
+	float3 RayOrigin;
+	float3 RayDirection;
+
+	Texture2D HZBTexture;
+	float4 HZBTextureSize;
+
+	int MaxMipLevel;
+	int MaxIterations;
+	// 假定物体厚度
+	float Thickness;
+};
+
+struct FHiZTraceResult
+{
+	bool bHit;
+	float3 HitUVz;
+	float Iterations;
+};
+
+float2 GetCellCount(int MipLevel, float4 RootSize)
+{
+	return floor(RootSize.xy * pow(2, -MipLevel));
+}
+float2 GetTexelSize(int MipLevel, float4 RootSize)
+{
+	return RootSize.zw * exp2(MipLevel);
+}
+
+FHiZTraceResult HiZTrace(FHiZTraceInput Input)
+{
+	FHiZTraceResult Result;
+    Result.bHit = false;
+    Result.HitUVz = float3(0, 0, 0);
+    Result.Iterations = 0;
+
+    float3 CurrentPos = Input.RayOrigin;
+    float3 RayDir = Input.RayDirection;
+
+	// 预计算的光线方向倒数
+    float3 InvRayDir;
+    InvRayDir.x = (abs(RayDir.x) < 1e-6) ? 1e6 * sign(RayDir.x) : 1.0 / RayDir.x;
+    InvRayDir.y = (abs(RayDir.y) < 1e-6) ? 1e6 * sign(RayDir.y) : 1.0 / RayDir.y;
+    InvRayDir.z = (abs(RayDir.z) < 1e-6) ? 1e6 * sign(RayDir.z) : 1.0 / RayDir.z;
+
+    int CurrentMip = 0;
+
+    [loop]
+    for (int i = 0; i < Input.MaxIterations; ++i)
+    {
+        Result.Iterations += 1.0;
+
+        float2 CellCount = GetCellCount(CurrentMip, Input.HZBSize);
+        float2 CellSize = 1.0 / CellCount;
+        float2 OldCellIdx = floor(CurrentPos.xy * CellCount);
+
+    	// 取中心位置
+        float2 SampleUV = (OldCellIdx + 0.5) * CellSize;
+        float HZB_Depth = Input.HZBTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, CurrentMip).r;
+
+    	// Reverze-Z
+    	// UE自带的Reverze-Z，为了接近解决 Z-Fighting（深度冲突） 问题。浮点数（float）在 0.0 附近的精度非常高，而在 1.0 附近的精度较低。
+    	// 在传统 Z (0近, 1远) 中，远处物体（接近 1.0）的深度精度很差，容易闪烁。
+    	// 在 Reverse-Z (1近, 0远) 中，远处物体（接近 0.0）利用了浮点数的高精度区间，极大地提升了远景的深度稳定性。
+        bool bIsBehind = CurrentPos.z <= HZB_Depth; 
+
+        if (bIsBehind)
+        {
+        	// 光线被挡住了
+
+        	// 第0层Mip
+            if (CurrentMip == 0)
+            {
+            	// 光线在物体的表面和背面之间
+                if (CurrentPos.z > HZB_Depth - Input.Thickness) 
+                {
+                    Result.bHit = true;
+                    Result.HitUVz = CurrentPos;
+                    return Result;
+                }
+                else
+                {
+                    // 穿透太深 (Occluded)，返回未命中
+                    Result.bHit = false; 
+                    return Result; 
+                }
+            }
+            else
+            {
+                CurrentMip--;
+            }
+        }
+        else
+        {
+        	// 光线未被挡住，Mip加速查询
+            float2 CellMin = OldCellIdx * CellSize;
+            float2 CellMax = CellMin + CellSize;
+
+        	float2 TargetBound = select(RayDir.xy > 0, CellMax, CellMin);
+        	// 光线公式,ray = origin + t * dir;
+        	float2 T_Max = (TargetBound - CurrentPos.xy) * InvRayDir.xy;
+            float DistToBoundary = min(T_Max.x, T_Max.y);
+
+            // Epsilon 自适应
+            float Epsilon = min(CellSize.x, CellSize.y) * 0.05; 
+            float StepDist = DistToBoundary + Epsilon;
+
+            CurrentPos += RayDir * StepDist;
+
+            // 边界检查
+            if (any(CurrentPos.xy < 0.0) || any(CurrentPos.xy > 1.0) || CurrentPos.z < 0.0 || CurrentPos.z > 1.0)
+            {
+                return Result; 
+            }
+
+            CurrentMip = min(CurrentMip + 1, Input.MaxMipLevel);
+        }
+    }
+
+    return Result;
+}
