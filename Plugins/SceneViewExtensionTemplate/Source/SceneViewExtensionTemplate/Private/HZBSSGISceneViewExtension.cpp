@@ -1,7 +1,9 @@
 ﻿#include "HZBSSGISceneViewExtension.h"
 
 #include "PixelShaderUtils.h"
+#include "SystemTextures.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
+
 
 IMPLEMENT_GLOBAL_SHADER(FHZBBuildCS, "/Plugins/SceneViewExtensionTemplate/HZB.usf", "HZBBuildCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSSGICS, "/Plugins/SceneViewExtensionTemplate/SSGI.usf", "SSGICS", SF_Compute);
@@ -23,7 +25,7 @@ namespace
 		TEXT(" 0: Normal (Composite Output);\n")
 		TEXT(" 1: Ray 迭代热力图;\n")
 		TEXT(" 2: Ray 击中 UV;\n")
-		TEXT(" 3: Ray 光线方向;\n")
+		TEXT(" 3: GBuffer 法线;\n")
 		TEXT(" 4: Visualize HZB (Mip 0);")
 		TEXT(" 5: 世界坐标重建检查 ;")
 		TEXT(" 6: 屏幕空间光线起点;")
@@ -180,12 +182,21 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 			PassParameters->HZBSize = FVector4f(HZBTexture->Desc.Extent.X, HZBTexture->Desc.Extent.Y, 1.0f / HZBTexture->Desc.Extent.X, 1.0f / HZBTexture->Desc.Extent.Y);
 			PassParameters->MaxMipLevel = NumMips - 1;
 			PassParameters->MaxIterations = 64;
-			PassParameters->Thickness = 2.0f;
-			PassParameters->RayLength = 100.0f;
-			PassParameters->Intensity = 10.0f;
+			PassParameters->Thickness = 10.0;
+			PassParameters->RayLength = 10.0f;
+			PassParameters->Intensity = 1.0f;
 			PassParameters->SSGI_Raw_Output = GraphBuilder.CreateUAV(SSGIOutputTexture);
 			PassParameters->View = View.ViewUniformBuffer;
 			PassParameters->InputSceneDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneDepth));
+			auto SceneTexturesShaderParameters = CreateSceneTextureUniformBuffer(GraphBuilder, View);
+			FRDGTextureRef BlackDummy = GSystemTextures.GetBlackDummy(GraphBuilder);
+			PassParameters->SSGI_GBufferA = SceneTexturesShaderParameters->GetParameters()->GBufferATexture ? SceneTexturesShaderParameters->GetParameters()->GBufferATexture : BlackDummy;
+			PassParameters->SSGI_GBufferB = SceneTexturesShaderParameters->GetParameters()->GBufferBTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferBTexture : BlackDummy;
+			PassParameters->SSGI_GBufferC = SceneTexturesShaderParameters->GetParameters()->GBufferCTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferCTexture : BlackDummy;
+			PassParameters->SSGI_GBufferD = SceneTexturesShaderParameters->GetParameters()->GBufferDTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferDTexture : BlackDummy;
+			PassParameters->SSGI_GBufferE = SceneTexturesShaderParameters->GetParameters()->GBufferETexture ? SceneTexturesShaderParameters->GetParameters()->GBufferETexture : BlackDummy;
+			PassParameters->SSGI_GBufferF = SceneTexturesShaderParameters->GetParameters()->GBufferFTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferFTexture : BlackDummy;
+			PassParameters->SSGI_GBufferVelocity = SceneTexturesShaderParameters->GetParameters()->GBufferVelocityTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferVelocityTexture : BlackDummy;
 			PassParameters->DebugMode = DebugMode;
 
 			// [新增] 填充手动参数

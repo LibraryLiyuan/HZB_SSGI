@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "SceneViewExtension.h"
 #include "ShaderParameterStruct.h"
+#include "SceneTextureParameters.h"
 
 class FHZBSSGISceneViewExtension : public FSceneViewExtensionBase
 {
@@ -57,6 +58,13 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HZBTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, SceneColorTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputSceneDepthTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferA)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferB)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferC)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferD)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferE)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferF)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferVelocity)
 		SHADER_PARAMETER(FVector4f, HZBSize)
 		SHADER_PARAMETER(int, MaxMipLevel)
 		SHADER_PARAMETER(int, MaxIterations)
@@ -65,7 +73,7 @@ public:
 		SHADER_PARAMETER(float, Intensity)
 	
 		SHADER_PARAMETER(int, DebugMode)
-	
+
 		// Output
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGI_Raw_Output)
 
