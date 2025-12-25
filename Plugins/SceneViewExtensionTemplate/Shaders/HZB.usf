@@ -1,4 +1,4 @@
-﻿
+﻿// Hi Z-Buffer
 #include "/Engine/Public/Platform.ush"
 
 Texture2D InputDepthTexture;

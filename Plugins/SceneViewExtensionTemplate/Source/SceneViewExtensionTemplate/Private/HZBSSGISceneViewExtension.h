@@ -45,3 +45,69 @@ public:
 		OutEnvironment.SetDefine(TEXT("THREADS_Z"), 1);
 	}
 };
+
+class SCENEVIEWEXTENSIONTEMPLATE_API FSSGICS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSSGICS);
+	SHADER_USE_PARAMETER_STRUCT(FSSGICS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		// Inputs
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HZBTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, SceneColorTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputSceneDepthTexture)
+		SHADER_PARAMETER(FVector4f, HZBSize)
+		SHADER_PARAMETER(int, MaxMipLevel)
+		SHADER_PARAMETER(int, MaxIterations)
+		SHADER_PARAMETER(float, Thickness)
+		SHADER_PARAMETER(float, RayLength)
+		SHADER_PARAMETER(float, Intensity)
+	
+		SHADER_PARAMETER(int, DebugMode)
+	
+		// Output
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGI_Raw_Output)
+
+	// [新增] 手动传递的关键 View 参数，不再依赖全局 View
+		SHADER_PARAMETER(FVector4f, ManualViewRectMin)       // 替代 View.ViewRectMin
+		SHADER_PARAMETER(FVector4f, ManualViewSizeAndInvSize)// 替代 View.ViewSizeAndInvSize
+		SHADER_PARAMETER(FVector4f, ManualBufferSizeAndInvSize) // 替代 View.BufferSizeAndInvSize
+		SHADER_PARAMETER(FMatrix44f, ManualSVPositionToTranslatedWorld) // 替代 SvPositionToResolvedTranslatedWorld 里的矩阵
+		SHADER_PARAMETER(FMatrix44f, ManualTranslatedWorldToClip)       // 替代 View.TranslatedWorldToClip
+	
+		// Engine Built-in
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADS_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Z"), 1);
+	}
+};
+
+class SCENEVIEWEXTENSIONTEMPLATE_API FSSGICompositeCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSSGICompositeCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSGICompositeCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGIResultTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+		SHADER_PARAMETER(FVector2f, ViewportSize)
+		SHADER_PARAMETER(int, DebugMode)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADS_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Z"), 1);
+	}
+};

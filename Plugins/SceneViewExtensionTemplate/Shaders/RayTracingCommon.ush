@@ -1,4 +1,6 @@
-﻿#pragma once
+﻿// 基于HZB的光线步进
+
+#pragma once
 
 #include "/Engine/Private/Common.ush"
 
@@ -8,7 +10,7 @@ struct FHiZTraceInput
 	float3 RayDirection;
 
 	Texture2D HZBTexture;
-	float4 HZBTextureSize;
+	float4 HZBSize;
 
 	int MaxMipLevel;
 	int MaxIterations;
