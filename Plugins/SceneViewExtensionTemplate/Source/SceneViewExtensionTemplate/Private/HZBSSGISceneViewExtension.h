@@ -14,6 +14,8 @@ public:
 
 	virtual void SubscribeToPostProcessingPass(EPostProcessingPass PassId, const FSceneView& View, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled) override ;
 	FScreenPassTexture HZBSSGIProcessPass(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs);
+private:
+	TRefCountPtr<IPooledRenderTarget> HistoryRenderTarget;
 };
 
 // HZB Mipmap Generation Shader
@@ -74,7 +76,8 @@ public:
 		SHADER_PARAMETER(float, RayLength)
 		SHADER_PARAMETER(float, Intensity)
 		SHADER_PARAMETER(int, DebugMode)
-
+		SHADER_PARAMETER(int, FrameIndex)
+	
 		// Output
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGI_Raw_Output)
 
@@ -110,6 +113,52 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
 		SHADER_PARAMETER(FVector2f, ViewportSize)
 		SHADER_PARAMETER(int, DebugMode)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADS_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Z"), 1);
+	}
+};
+class SCENEVIEWEXTENSIONTEMPLATE_API FSSGIDenoiserCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSSGIDenoiserCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSGIDenoiserCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGIInputTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GBufferATexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGIDenoiseOutput)
+		SHADER_PARAMETER(FVector4f, ViewportSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADS_X"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Y"), 8);
+		OutEnvironment.SetDefine(TEXT("THREADS_Z"), 1);
+	}
+};
+class SCENEVIEWEXTENSIONTEMPLATE_API FSSGITemporalCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSSGITemporalCS);
+	SHADER_USE_PARAMETER_STRUCT(FSSGITemporalCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CurrentFrameTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HistoryTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VelocityTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+		SHADER_PARAMETER(FVector4f, ViewportSize)
+		SHADER_PARAMETER(float, HistoryWeight)
+		SHADER_PARAMETER_SAMPLER(SamplerState, BilinearSampler)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)

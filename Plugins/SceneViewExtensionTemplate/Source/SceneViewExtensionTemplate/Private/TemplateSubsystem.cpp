@@ -4,7 +4,6 @@
 // Subsystem to keep custom SceneViewExtension alive
 
 #include "TemplateSubsystem.h"
-#include "CustomSceneViewExtension.h"
 #include "HZBSSGISceneViewExtension.h"
 #include "SceneViewExtension.h"
 

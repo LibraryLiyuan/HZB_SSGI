@@ -1,0 +1,135 @@
+﻿// [SSGIDenoiser.usf] - 完整修复版
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+// 输入
+Texture2D SSGIInputTexture;
+Texture2D SceneDepthTexture; 
+Texture2D GBufferATexture; 
+
+// 输出
+RWTexture2D<float4> SSGIDenoiseOutput;
+
+// 参数
+float4 ViewportSize; 
+
+// -------------------------------------------------------
+// 辅助函数
+// -------------------------------------------------------
+
+float3 DecodeNormal(float2 Oct)
+{
+    Oct = Oct * 2.0 - 1.0;
+    float3 N = float3(Oct, 1.0 - dot(1.0, abs(Oct)));
+    if (N.z < 0)
+    {
+        float2 SignNotZero = float2(N.x >= 0 ? 1.0 : -1.0, N.y >= 0 ? 1.0 : -1.0);
+        N.xy = (1.0 - abs(N.yx)) * SignNotZero;
+    }
+    return normalize(N);
+}
+
+float GetLinearDepth(float2 UV)
+{
+    float DeviceZ = SceneDepthTexture.SampleLevel(GlobalPointClampedSampler, UV, 0).r;
+    return ConvertFromDeviceZ(DeviceZ);
+}
+
+float3 GetWorldNormal(float2 UV)
+{
+    float2 Oct = GBufferATexture.SampleLevel(GlobalPointClampedSampler, UV, 0).xy;
+    return DecodeNormal(Oct);
+}
+
+// -------------------------------------------------------
+// 主函数
+// -------------------------------------------------------
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void DenoiserCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 PixelPos = DispatchThreadID.xy;
+    if (any(PixelPos >= uint2(ViewportSize.xy))) return;
+
+    float2 UV = (float2(PixelPos) + 0.5) * ViewportSize.zw;
+
+    // 1. 读取中心数据
+    float4 CenterColor = SSGIInputTexture.SampleLevel(GlobalPointClampedSampler, UV, 0);
+    float CenterDepth = GetLinearDepth(UV);
+    float3 CenterNormal = GetWorldNormal(UV);
+    float CenterLuma = Luminance(CenterColor.rgb);
+
+    // 累加器初始化
+    float4 SumColor = CenterColor;
+    float TotalWeight = 1.0; 
+    // 注意：中心点的权重在循环中通常会被再次计算或单独处理。
+    // 为了算法纯粹性，这里我们可以把 TotalWeight 设为 0，然后在循环里包含中心点 (0,0)。
+    // 下面的循环会跳过 (0,0)，所以我们保持 CenterColor 的初始贡献，并将 TotalWeight 设为 1.0 (代表中心点权重为1)
+    
+    // 2. 参数设置
+    // 半径设为 1 (3x3)，防止糊掉细节
+    const int KernelRadius = 1; 
+    
+    // 深度阈值：20cm
+    const float DepthThreshold = 20.0; 
+    // 法线阈值：0.85 (约30度)
+    const float NormalThreshold = 0.85; 
+    
+    // [参数应用 1] 高斯模糊的空间参数
+    // 半径为1时，Sigma取0.5~1.0比较合适
+    const float Sigma = 1.0; 
+    
+    // [参数应用 2] 萤火虫抑制强度
+    // 值越大，对亮度差异越敏感（越能抑制亮点）
+    const float MaxLumaDiff = 10.0; 
+
+    // 3. 循环采样
+    for (int x = -KernelRadius; x <= KernelRadius; x++)
+    {
+        for (int y = -KernelRadius; y <= KernelRadius; y++)
+        {
+            // 跳过中心点 (因为上面已经初始化进去了，且中心点和自己算权重恒为1)
+            if (x == 0 && y == 0) continue;
+
+            int2 SamplePos = PixelPos + int2(x, y);
+            float2 SampleUV = (float2(SamplePos) + 0.5) * ViewportSize.zw;
+
+            // 越界检查
+            if (any(SampleUV < 0.0) || any(SampleUV > 1.0)) continue;
+
+            // 读取邻居
+            float NeighborDepth = GetLinearDepth(SampleUV);
+            float3 NeighborNormal = GetWorldNormal(SampleUV);
+            float4 NeighborColor = SSGIInputTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0);
+            float NeighborLuma = Luminance(NeighborColor.rgb);
+
+            // ================= [权重计算] =================
+            
+            // A. 深度权重 (硬切断，保护边缘)
+            float DepthDiff = abs(CenterDepth - NeighborDepth);
+            float W_Depth = (DepthDiff < DepthThreshold) ? 1.0 : 0.0;
+
+            // B. 法线权重 (硬切断，保护转角)
+            float NormalDot = dot(CenterNormal, NeighborNormal);
+            float W_Normal = (NormalDot > NormalThreshold) ? 1.0 : 0.0;
+            
+            // C. [修复] 距离权重 (使用 Sigma 进行高斯衰减)
+            float Dist2 = float(x*x + y*y);
+            float W_Dist = exp(-Dist2 / (2.0 * Sigma * Sigma));
+
+            // D. [修复] 亮度权重 (萤火虫抑制)
+            // 差异越大，分母越大，权重越小 -> 抑制亮点扩散
+            float LumaDiff = abs(CenterLuma - NeighborLuma);
+            float W_Luma = 1.0 / (1.0 + LumaDiff * MaxLumaDiff);
+
+            // 综合权重
+            float Weight = W_Depth * W_Normal * W_Dist * W_Luma;
+            // =============================================
+
+            SumColor += NeighborColor * Weight;
+            TotalWeight += Weight;
+        }
+    }
+
+    // 4. 归一化输出
+    SSGIDenoiseOutput[PixelPos] = SumColor / TotalWeight;
+}

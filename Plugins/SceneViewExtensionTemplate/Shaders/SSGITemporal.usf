@@ -1,0 +1,89 @@
+﻿// [SSGITemporal.usf] - 稳定版 (Stabilized Variance Clipping)
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+Texture2D CurrentFrameTexture; 
+Texture2D HistoryTexture;      
+Texture2D VelocityTexture;     
+RWTexture2D<float4> OutputTexture;
+
+float4 ViewportSize; 
+float HistoryWeight; 
+SamplerState BilinearSampler;
+
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 PixelPos = DispatchThreadID.xy;
+    if (any(PixelPos >= uint2(ViewportSize.xy))) return;
+
+    float2 UV = (float2(PixelPos) + 0.5) * ViewportSize.zw;
+
+    // 1. 读取当前帧中心像素
+    float4 CurrentColor = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, UV, 0);
+
+    // ================= [核心改进: 稳定的方差统计] =================
+    float3 m1 = 0.0; 
+    float3 m2 = 0.0; 
+    
+    // 增加半径到 2 (即 5x5 窗口)，这能显著减少"结块"
+    const int Radius = 2; 
+    const float SampleCount = (Radius * 2 + 1) * (Radius * 2 + 1);
+
+    for(int x = -Radius; x <= Radius; x++)
+    {
+        for(int y = -Radius; y <= Radius; y++)
+        {
+            float2 NeighborUV = UV + float2(x, y) * ViewportSize.zw;
+            float3 C = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, NeighborUV, 0).rgb;
+            m1 += C;
+            m2 += C * C;
+        }
+    }
+    
+    float3 Mean = m1 / SampleCount;
+    float3 StdDev = sqrt(abs((m2 / SampleCount) - (Mean * Mean)));
+    
+    // [关键改进] 设置 Sigma 底限，防止暗处历史被彻底抹杀
+    // 0.01 是一个经验值，取决于你的场景亮度
+    StdDev = max(StdDev, 0.01); 
+
+    // 设置 Gamma：对于 1 SPP，建议给大一点（3.0 ~ 4.0）
+    float Gamma = 4.0;
+    float3 MinColor = Mean - Gamma * StdDev;
+    float3 MaxColor = Mean + Gamma * StdDev;
+
+    // ================= [重投影逻辑] =================
+    float4 VelocitySample = VelocityTexture.SampleLevel(GlobalPointClampedSampler, UV, 0);
+    float2 Velocity = VelocitySample.xy;
+    float2 PrevUV = UV - Velocity;
+
+    bool bOffScreen = any(PrevUV < 0.0) || any(PrevUV > 1.0);
+    float4 HistoryColor = CurrentColor;
+    
+    if (!bOffScreen)
+    {
+        HistoryColor = HistoryTexture.SampleLevel(BilinearSampler, PrevUV, 0);
+        
+        // [核心改进: 使用 Clipping 替代 Clamp]
+        // Clipping 会将历史颜色拉向均值，比 Clamp 产生的画面更柔和
+        float3 ClampedHistory = clamp(HistoryColor.rgb, MinColor, MaxColor);
+        
+        // 如果历史和当前差异太大，强制降低历史权重（抗鬼影）
+        // 但目前为了稳定累积，我们先用最稳的 Clamp
+        HistoryColor.rgb = ClampedHistory;
+    }
+
+    // ================= [混合] =================
+    if (bOffScreen)
+    {
+        OutputTexture[PixelPos] = CurrentColor;
+    }
+    else
+    {
+        // 建议继续使用 0.9 或 0.95 的高权重
+        float4 FinalColor = lerp(CurrentColor, HistoryColor, HistoryWeight);
+        FinalColor.a = 1.0; 
+        OutputTexture[PixelPos] = FinalColor;
+    }
+}

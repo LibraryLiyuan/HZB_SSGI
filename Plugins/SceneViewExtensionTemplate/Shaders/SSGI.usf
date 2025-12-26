@@ -25,6 +25,7 @@ float Thickness;
 float RayLength;
 float Intensity;
 int DebugMode;
+int FrameIndex; // [新增]
 
 // [Manual View Data]
 float4 ManualViewRectMin;
@@ -36,18 +37,37 @@ float4x4 ManualTranslatedWorldToClip;
 // [Output]
 RWTexture2D<float4> SSGI_Raw_Output;
 
-// [Helpers]
 static uint3 RandState;
+
+// 使用 PCG 风格的哈希函数，它比线性组合更能打散数据，消除条纹
+uint Hash(uint x)
+{
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = (x >> 16) ^ x;
+    return x;
+}
+
 void RandInit(uint2 PixelPos, uint FrameIndex, uint Seed)
 {
-    RandState.x = PixelPos.x * 49157 + PixelPos.y;
-    RandState.y = FrameIndex * 389 + Seed;
-    RandState.z = PixelPos.x ^ PixelPos.y ^ Seed;
+    // 1. 将所有输入组合成一个基础种子
+    // 使用位移和异或来确保每个位的变化都能影响最终结果
+    uint CombinedSeed = PixelPos.x + (PixelPos.y << 16);
+    
+    // 2. 依次混入 FrameIndex (让噪点随时间跳动) 和 Seed (让多次采样互不相关)
+    CombinedSeed = Hash(CombinedSeed ^ Hash(FrameIndex));
+    CombinedSeed = Hash(CombinedSeed ^ Hash(Seed));
+
+    // 3. 初始化状态
+    RandState.x = CombinedSeed;
+    RandState.y = Hash(CombinedSeed + 1);
+    RandState.z = Hash(CombinedSeed + 2);
 }
+
 float Rand()
 {
+    // 简单的 LCG 迭代
     RandState.x = (RandState.x * 1664525 + 1013904223);
-    RandState.y = (RandState.y * 1664525 + 1013904223);
     return float(RandState.x) / 4294967296.0;
 }
 
@@ -126,24 +146,17 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
     // 采样次数：如果不降噪，建议至少设为 4。
     // 如果性能允许，可以设为 8 或 16（画面会很细腻，但很卡）
     int NumSamples = 1; 
-    if (BufferUV.x > 0.5)
-    {
-        NumSamples = 16; // 右边跑 16 次
-    }
-    else
-    {
-        NumSamples = 1;  // 左边跑 1 次
-    }
     
     float3 AccumulatedColor = 0;
     float ValidSamples = 0;
 
     // 初始化随机种子基数
-    uint LinearIndex = PixelPos.y * ViewportSize.x + PixelPos.x;
-    RandInit(LinearIndex, View.StateFrameIndexMod8, LinearIndex * 114);
+    //uint LinearIndex = PixelPos.y * ViewportSize.x + PixelPos.x;
+    
     
     for (int i = 0; i < NumSamples; i++)
     {
+        RandInit(PixelPos, FrameIndex, i);
         float2 RandE = float2(Rand(), Rand());
         
         // 生成随机光线方向
@@ -237,6 +250,12 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
             if (all(HitBufferUV >= 0.0) && all(HitBufferUV <= 1.0))
             {
                 float3 HitColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, HitBufferUV, 0).rgb;
+                float MaxBrightness = 10.0;
+                float Luma = dot(HitColor, float3(0.2126, 0.7152, 0.0722));
+                if (Luma > MaxBrightness)
+                {
+                    HitColor *= (MaxBrightness / Luma);
+                }
                 AccumulatedColor += HitColor;
                 ValidSamples += 1.0;
             }
