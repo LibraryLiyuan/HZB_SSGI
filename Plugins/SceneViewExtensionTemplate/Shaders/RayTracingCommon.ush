@@ -1,7 +1,5 @@
 ﻿// RayTracingCommon.ush
 #pragma once
-
-// 必须包含 Common.ush 以使用 ConvertFromDeviceZ 和 View Uniform
 #include "/Engine/Private/Common.ush"
 
 struct FHiZTraceInput
@@ -10,12 +8,12 @@ struct FHiZTraceInput
 	float3 RayDirection;
 
 	Texture2D HZBTexture;
-	float4 HZBSize; // xy: Size, zw: InvSize
+	// xy: Size, zw: InvSize
+	float4 HZBSize; 
 
 	int MaxMipLevel;
 	int MaxIterations;
-	
-	// [修改] 这里的 Thickness 现在必须是线性单位 (厘米)，例如 10.0
+	// 单位：厘米
 	float Thickness; 
 };
 
@@ -31,11 +29,6 @@ float2 GetCellCount(int MipLevel, float4 RootSize)
 	return floor(RootSize.xy * exp2(-MipLevel));
 }
 
-float2 GetTexelSize(int MipLevel, float4 RootSize)
-{
-	return RootSize.zw * exp2(MipLevel);
-}
-
 FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 {
 	FHiZTraceResult Result;
@@ -43,115 +36,73 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 	Result.HitUVz = float3(0, 0, 0);
 	Result.Iterations = 0;
 
-	// CurrentPos.xy 是 UV (0~1), .z 是 DeviceZ (0~1, Reverse-Z)
 	float3 CurrentPos = Input.RayOrigin;
 	float3 RayDir = Input.RayDirection;
 
-	// 预计算倒数，防止除零
 	float3 InvRayDir;
 	InvRayDir.x = (abs(RayDir.x) < 1e-6) ? 1e6 : 1.0 / RayDir.x;
 	InvRayDir.y = (abs(RayDir.y) < 1e-6) ? 1e6 : 1.0 / RayDir.y;
 	InvRayDir.z = (abs(RayDir.z) < 1e-6) ? 1e6 : 1.0 / RayDir.z;
 
-	int CurrentMip = 0; // 从 Mip 0 开始，或者从更高 Mip 开始优化
+	int CurrentMip = 0;
 	float Iterations = 0;
-
-	// 初始偏移，防止自身遮挡
-	// CurrentPos += RayDir * 0.001; 
 
 	while (CurrentMip >= 0 && CurrentMip <= Input.MaxMipLevel && Iterations < Input.MaxIterations)
 	{
 		Iterations++;
 
-		// 1. 获取当前 Mip 的网格信息
 		float2 CellCount = GetCellCount(CurrentMip, Input.HZBSize);
-		float2 CellSize = 1.0 / CellCount; // UV 空间的一个格子大小
-
-		// 2. 采样 HZB 当前 Mip 的深度 (Device Z)
-		// 注意：UE5 是 Reverse-Z (近1, 远0)
-		// HZB 应该存储的是 tile 内的"最近"表面深度 (Max DeviceZ)
+		float2 CellSize = 1.0 / CellCount;
 		float2 CellUV = (floor(CurrentPos.xy * CellCount) + 0.5) * CellSize;
+		
 		float HZB_DeviceZ = Input.HZBTexture.SampleLevel(GlobalPointClampedSampler, CellUV, CurrentMip).r;
-		
-		// 3. 比较深度 (Traversal Logic)
-		// 在 Reverse-Z 下，如果 RayDeviceZ < HZB_DeviceZ，说明 Ray 在 HZB 平面"后面" (更远)，可能相交
-		// 如果 RayDeviceZ > HZB_DeviceZ，说明 Ray 在 HZB 平面"前面" (更近)，被安全剔除
-		
-		// 容差值 (Epsilon) 用于防止精度问题
-		const float DepthEpsilon = 0.0001; 
+		const float DepthEpsilon = 0.0001;
 
+		// 比较深度 (Reverse-Z)
 		if (CurrentPos.z < HZB_DeviceZ + DepthEpsilon) 
 		{
-			// [情况 A] 光线在 HZB 表面之后 (潜在相交)
-			
 			if (CurrentMip == 0)
 			{
-				// ================= [核心修改开始] =================
-				// 在 Mip 0 进行精确的线性深度比较 (Linear Depth Test)
-				
-				// 1. 将 Device Z 转为 Linear Z (单位：厘米，正值)
-				// ConvertFromDeviceZ 是 UE 内置函数
+				// 线性深度比较 (Linear Depth Test)
 				float Linear_HZB = ConvertFromDeviceZ(HZB_DeviceZ);
 				float Linear_Ray = ConvertFromDeviceZ(CurrentPos.z);
-
-				// 2. 计算距离差 (Ray 有多深?)
 				float DistDiff = Linear_Ray - Linear_HZB;
 
-				// 3. 判定命中
-				// 条件1: DistDiff > 0 (光线确实在表面后面)
-				// 条件2: DistDiff < Thickness (光线没有穿透太深，即还在"壳"的厚度内)
+				// 命中判定：在表面后方，且在厚度范围内
 				if (DistDiff > 0.0 && DistDiff < Input.Thickness)
 				{
 					Result.bHit = true;
-					// 返回 HZB 的深度作为命中点深度，修正光线位置到表面
 					Result.HitUVz = float3(CurrentPos.xy, HZB_DeviceZ); 
 					Result.Iterations = Iterations;
 					return Result;
 				}
 				else
 				{
-					// 未命中 (Miss): 
-					// 要么是在表面前面 (不应该发生，因为外层if已经判断了 < )
-					// 要么是穿透太深 (Occluded / Behind Surface)，视为未遮挡，继续前进
+					// 未命中：穿透太深或误差，视为未遮挡，继续步进
 					Result.bHit = false;
-					// 这里不返回，继续下面的步进逻辑，穿过物体
 				}
-				// ================= [核心修改结束] =================
 			}
 			else
 			{
-				// 如果不是 Mip 0，但潜在相交，则降级去更精细的 Mip 检查
+				// 降级 Mip
 				CurrentMip--;
-				continue; // 重新开始循环
+				continue;
 			}
 		}
 
-		// [情况 B] 光线在表面前面，或者穿透了物体 -> 步进到下一个格子 (Ray Marching)
+		// Ray Marching: 步进到下一个格子
 		{
-			// 计算光线射出当前格子的距离
 			float2 CurrentCellIdx = floor(CurrentPos.xy * CellCount);
-			// 确定边界：如果方向是正，边界是(Index+1)*Size；如果负，边界是 Index*Size
 			float2 BoundaryUV = (CurrentCellIdx + float2(RayDir.x > 0 ? 1.0 : 0.0, RayDir.y > 0 ? 1.0 : 0.0)) * CellSize;
-			
-			// 计算到达边界的 t 值 (Ray = Origin + t * Dir)
 			float2 T_Boundary = (BoundaryUV - CurrentPos.xy) * InvRayDir.xy;
-			
-			// 取最小的 t，即先碰到 x 边界还是 y 边界
-			float StepT = min(T_Boundary.x, T_Boundary.y);
-			
-			// 加上一点点偏移，确保跨过边界
-			StepT += 0.0001; 
+			float StepT = min(T_Boundary.x, T_Boundary.y) + 0.0001;
 
-			// 更新光线位置
 			CurrentPos += RayDir * StepT;
-
-			// 既然我们安全跨过了这个格子，我们可以尝试升级 Mip 以加速
-			// (简单的逻辑是每次步进后尝试回到高一级 Mip)
 			CurrentMip = min(CurrentMip + 1, Input.MaxMipLevel);
 		}
 
 		// 越界检查
-		if (any(CurrentPos.xy < 0.0) || any(CurrentPos.xy > 1.0) || CurrentPos.z < 0.0001) // Far plane is 0.0
+		if (any(CurrentPos.xy < 0.0) || any(CurrentPos.xy > 1.0) || CurrentPos.z < 0.0001)
 		{
 			break;
 		}

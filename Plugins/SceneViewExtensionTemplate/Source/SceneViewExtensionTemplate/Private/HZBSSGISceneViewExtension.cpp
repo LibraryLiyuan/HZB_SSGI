@@ -1,278 +1,176 @@
 ﻿#include "HZBSSGISceneViewExtension.h"
-
 #include "PixelShaderUtils.h"
 #include "SystemTextures.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 
-
 IMPLEMENT_GLOBAL_SHADER(FHZBBuildCS, "/Plugins/SceneViewExtensionTemplate/HZB.usf", "HZBBuildCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSSGICS, "/Plugins/SceneViewExtensionTemplate/SSGI.usf", "SSGICS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FSSGICompositeCS, "/Plugins/SceneViewExtensionTemplate/SSGIComposite.usf", "CompositeCS", SF_Compute);  // 改为 CS
+IMPLEMENT_GLOBAL_SHADER(FSSGICompositeCS, "/Plugins/SceneViewExtensionTemplate/SSGIComposite.usf", "CompositeCS", SF_Compute);
 
 namespace
 {
 	TAutoConsoleVariable<int32> CVarHZBSSGIOn(
-		TEXT("r.HZBSSGI"),
-		0,
-		TEXT("Enable HZB SSGI SceneViewExtension \n")
-		TEXT(" 0: OFF;")
-		TEXT(" 1: ON."),
-		ECVF_RenderThreadSafe);
+		TEXT("r.HZBSSGI"), 0, TEXT("Enable HZB SSGI SceneViewExtension"), ECVF_RenderThreadSafe);
 	TAutoConsoleVariable<int32> CVarSSGIDebug(
-		TEXT("r.HZBSSGI.Debug"),
-		0,
-		TEXT("Debug mode for SSGI \n")
-		TEXT(" 0: Normal (Composite Output);\n")
-		TEXT(" 1: Ray 迭代热力图;\n")
-		TEXT(" 2: Ray 击中 UV;\n")
-		TEXT(" 3: GBuffer 法线;\n")
-		TEXT(" 4: Visualize HZB (Mip 0);")
-		TEXT(" 5: 世界坐标重建检查 ;")
-		TEXT(" 6: 屏幕空间光线起点;")
-		TEXT(" 7: 深度检查;"),
-		ECVF_RenderThreadSafe);
+		TEXT("r.HZBSSGI.Debug"), 0, TEXT("Debug mode for SSGI"), ECVF_RenderThreadSafe);
 }
 
 FHZBSSGISceneViewExtension::FHZBSSGISceneViewExtension(const FAutoRegister& AutoRegister) : FSceneViewExtensionBase(AutoRegister)
 {
-	UE_LOG(LogTemp, Log, TEXT("HZBSSGISceneViewExtension: Extension registered"));
 }
 
 void FHZBSSGISceneViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass PassId, const FSceneView& View, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled)
 {
-	// 临时换成 MotionBlur 来测试
-	if (PassId == EPostProcessingPass::MotionBlur)
+	if (PassId == EPostProcessingPass::SSRInput)
 	{
-		InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this,&FHZBSSGISceneViewExtension::HZBSSGIProcessPass));
+		InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FHZBSSGISceneViewExtension::HZBSSGIProcessPass));
 	}
 }
 
-
 FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
 {
-	// 检查是否启用
 	if (CVarHZBSSGIOn.GetValueOnRenderThread() == 0)
 	{
 		return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
 	}
 	
+	// 1. 获取 SceneDepth
 	const FSceneTextureShaderParameters& SceneTextures = Inputs.SceneTextures;
 	FRDGTextureRef SceneDepth = nullptr;
+	
+	// 简化获取逻辑：优先从 SceneTextureUniformBuffer 获取
 	if (SceneTextures.SceneTextures)
 	{
-		TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextureUniformBuffer = SceneTextures.SceneTextures.GetUniformBuffer();
-		if (SceneTextureUniformBuffer)
-		{
-			SceneDepth = SceneTextureUniformBuffer->GetParameters()->SceneDepthTexture;
-		}
+		auto* UniformBuffer = SceneTextures.SceneTextures.GetUniformBuffer();
+		if (UniformBuffer) SceneDepth = UniformBuffer->GetParameters()->SceneDepthTexture;
 	}
+	// Fallback for Mobile (Optional)
 	else if (SceneTextures.MobileSceneTextures)
 	{
-		TRDGUniformBufferRef<FMobileSceneTextureUniformParameters> MobileSceneTextureUniformBuffer = SceneTextures.MobileSceneTextures.GetUniformBuffer();
-		if (MobileSceneTextureUniformBuffer)
-		{
-			SceneDepth = MobileSceneTextureUniformBuffer->GetParameters()->SceneDepthTexture;
-		}
+		auto* UniformBuffer = SceneTextures.MobileSceneTextures.GetUniformBuffer();
+		if (UniformBuffer) SceneDepth = UniformBuffer->GetParameters()->SceneDepthTexture;
 	}
+
 	if (!SceneDepth)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[SSGI] SceneDepth is NULL! Pass Aborted."));
 		return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
 	}
 	
-	RDG_EVENT_SCOPE(GraphBuilder, "HZBSSGI Generate");
-	
+	RDG_EVENT_SCOPE(GraphBuilder, "HZBSSGI");
+
+	// 2. 构建 HZB (Hi-Z Buffer)
 	auto SceneSize = SceneDepth->Desc.Extent;
-	int32 NumMips = FMath::FloorLog2(FMath::Max(SceneSize.X,SceneSize.Y)) + 1;
+	int32 NumMips = FMath::FloorLog2(FMath::Max(SceneSize.X, SceneSize.Y)) + 1;
 
 	FRDGTextureDesc HZBDesc = FRDGTextureDesc::Create2D(
-		SceneSize,
-		PF_R32_FLOAT,
-		FClearValueBinding::None,
+		SceneSize, PF_R32_FLOAT, FClearValueBinding::None,
 		TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable
 	);
 	HZBDesc.NumMips = NumMips;
 	FRDGTextureRef HZBTexture = GraphBuilder.CreateTexture(HZBDesc, TEXT("HZB Texture"));
 
-	// AddCopyTexturePass(
-	// 	GraphBuilder,
-	// 	SceneDepth,
-	// 	HZBTexture,
-	// 	FRHICopyTextureInfo()
-	// );
-
-	// 2. 将 SceneDepth 绘制到 HZB Mip 0
-	// 创建输入包装
+	// Mip 0 Generation (Draw Pass)
 	FScreenPassTexture SceneDepthInput(SceneDepth);
-    
-	// [修正] 使用正确的构造函数
-	// 方案 A: 使用 2 参数构造函数 (自动使用整个纹理大小，即 Mip 0)
 	FScreenPassRenderTarget HZBMip0(HZBTexture, ERenderTargetLoadAction::ENoAction);
-
-	/* // 方案 B: 如果你想显式使用 3 参数构造函数 (如你问题所述)，应该传入 FIntRect：
-	FScreenPassRenderTarget HZBMip0(
-		HZBTexture, 
-		FIntRect(0, 0, SceneSize.X, SceneSize.Y), // ViewRect
-		ERenderTargetLoadAction::ENoAction
-	);
-	*/
-    
-	// 执行绘制 Pass (替代原来的 Copy Pass)
-	AddDrawTexturePass(
-		GraphBuilder,
-		View,            // 如果这里报错无法转换，请试着改成 static_cast<const FViewInfo&>(View)
-		SceneDepthInput, // 输入
-		HZBMip0          // 输出
-	);
+	AddDrawTexturePass(GraphBuilder, View, SceneDepthInput, HZBMip0);
 	
+	// Mip 1..N Generation (Compute Pass)
 	UE::Math::TIntPoint<int32> CurrentInputSize = SceneSize;
 	for (int32 MipLevel = 1; MipLevel < NumMips; MipLevel++)
 	{
 		UE::Math::TIntPoint<int32> NextOutputSize;
-		NextOutputSize.X = FMath::Max(1,CurrentInputSize.X/2);
-		NextOutputSize.Y = FMath::Max(1,CurrentInputSize.Y/2);
+		NextOutputSize.X = FMath::Max(1, CurrentInputSize.X / 2);
+		NextOutputSize.Y = FMath::Max(1, CurrentInputSize.Y / 2);
 
 		FHZBBuildCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FHZBBuildCS::FParameters>();
-
-		FRDGTextureSRVRef InputSRV = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(HZBTexture,MipLevel - 1));
-		PassParameters->InputDepthTexture = InputSRV;
-		PassParameters->InputViewportMaxBound = FVector2f(CurrentInputSize.X-1,CurrentInputSize.Y-1);
-
-		FRDGTextureUAVRef OutputUAV = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(HZBTexture,MipLevel));
-		PassParameters->OutputDepthTexture = OutputUAV;
-		PassParameters->OutputViewportSize = FVector2f(NextOutputSize.X,NextOutputSize.Y);
+		PassParameters->InputDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(HZBTexture, MipLevel - 1));
+		PassParameters->InputViewportMaxBound = FVector2f(CurrentInputSize.X - 1, CurrentInputSize.Y - 1);
+		PassParameters->OutputDepthTexture = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(HZBTexture, MipLevel));
+		PassParameters->OutputViewportSize = FVector2f(NextOutputSize.X, NextOutputSize.Y);
 
 		TShaderMapRef<FHZBBuildCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FIntVector GroupCount(FMath::DivideAndRoundUp(NextOutputSize.X, 8), FMath::DivideAndRoundUp(NextOutputSize.Y, 8), 1);
 		
-		FIntVector GroupCount(
-			FMath::DivideAndRoundUp(NextOutputSize.X,8),
-			FMath::DivideAndRoundUp(NextOutputSize.Y,8),
-			1);
-		FComputeShaderUtils::AddPass(
-			GraphBuilder,
-			RDG_EVENT_NAME("HZBSSGI Generate HZB Mip%d (%dx%d)",MipLevel,NextOutputSize.X,NextOutputSize.Y),
-			ComputeShader,
-			PassParameters,
-			GroupCount
-		);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("HZB Mip%d", MipLevel), ComputeShader, PassParameters, GroupCount);
 		CurrentInputSize = NextOutputSize;
 	}
-	
-	//GraphBuilder.QueueTextureExtraction(HZBTexture, &ExtractedHZBTexture);
 
-	// SSGI Pass
+	// 3. SSGI Trace Pass
 	FScreenPassTextureSlice SceneColorSlice = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
-	if (SceneColorSlice.IsValid())
+	if (!SceneColorSlice.IsValid()) return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
+
+	FRDGTextureDesc SSGIOutputDesc = FRDGTextureDesc::Create2D(
+		SceneColorSlice.ViewRect.Size(), PF_FloatRGBA, FClearValueBinding::Black,
+		TexCreate_ShaderResource | TexCreate_UAV
+	);
+	FRDGTextureRef SSGIOutputTexture = GraphBuilder.CreateTexture(SSGIOutputDesc, TEXT("SSGI_Raw_Output"));
+	
 	{
-		FIntPoint SSGIPassSize = SceneColorSlice.ViewRect.Size();
-		FRDGTextureDesc SSGIOutputDesc = FRDGTextureDesc::Create2D(
-			SSGIPassSize,
-			PF_FloatRGBA,
-			FClearValueBinding::Black,
-			TexCreate_ShaderResource | TexCreate_UAV
-		);
-		FRDGTextureRef SSGIOutputTexture = GraphBuilder.CreateTexture(SSGIOutputDesc, TEXT("SSGI_Raw_Output"));
-		int32 DebugMode = CVarSSGIDebug.GetValueOnRenderThread();
-		{
-			TShaderMapRef<FSSGICS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FSSGICS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSSGICS::FParameters>();
+		TShaderMapRef<FSSGICS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSSGICS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSSGICS::FParameters>();
 
-			PassParameters->HZBTexture = HZBTexture;
-			PassParameters->SceneColorTexture = SceneColorSlice.TextureSRV;  // 修正：使用 TextureSRV
-			PassParameters->HZBSize = FVector4f(HZBTexture->Desc.Extent.X, HZBTexture->Desc.Extent.Y, 1.0f / HZBTexture->Desc.Extent.X, 1.0f / HZBTexture->Desc.Extent.Y);
-			PassParameters->MaxMipLevel = NumMips - 1;
-			PassParameters->MaxIterations = 64;
-			PassParameters->Thickness = 10.0;
-			PassParameters->RayLength = 10.0f;
-			PassParameters->Intensity = 1.0f;
-			PassParameters->SSGI_Raw_Output = GraphBuilder.CreateUAV(SSGIOutputTexture);
-			PassParameters->View = View.ViewUniformBuffer;
-			PassParameters->InputSceneDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneDepth));
-			auto SceneTexturesShaderParameters = CreateSceneTextureUniformBuffer(GraphBuilder, View);
-			FRDGTextureRef BlackDummy = GSystemTextures.GetBlackDummy(GraphBuilder);
-			PassParameters->SSGI_GBufferA = SceneTexturesShaderParameters->GetParameters()->GBufferATexture ? SceneTexturesShaderParameters->GetParameters()->GBufferATexture : BlackDummy;
-			PassParameters->SSGI_GBufferB = SceneTexturesShaderParameters->GetParameters()->GBufferBTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferBTexture : BlackDummy;
-			PassParameters->SSGI_GBufferC = SceneTexturesShaderParameters->GetParameters()->GBufferCTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferCTexture : BlackDummy;
-			PassParameters->SSGI_GBufferD = SceneTexturesShaderParameters->GetParameters()->GBufferDTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferDTexture : BlackDummy;
-			PassParameters->SSGI_GBufferE = SceneTexturesShaderParameters->GetParameters()->GBufferETexture ? SceneTexturesShaderParameters->GetParameters()->GBufferETexture : BlackDummy;
-			PassParameters->SSGI_GBufferF = SceneTexturesShaderParameters->GetParameters()->GBufferFTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferFTexture : BlackDummy;
-			PassParameters->SSGI_GBufferVelocity = SceneTexturesShaderParameters->GetParameters()->GBufferVelocityTexture ? SceneTexturesShaderParameters->GetParameters()->GBufferVelocityTexture : BlackDummy;
-			PassParameters->DebugMode = DebugMode;
-
-			// [新增] 填充手动参数
-			// 1. ViewRectMin (xy是偏移)
-			PassParameters->ManualViewRectMin = FVector4f(SceneColorSlice.ViewRect.Min.X, SceneColorSlice.ViewRect.Min.Y, 0, 0);
-			
-			// 2. ViewSize
-			FVector2f ViewSize = FVector2f(SceneColorSlice.ViewRect.Width(), SceneColorSlice.ViewRect.Height());
-			PassParameters->ManualViewSizeAndInvSize = FVector4f(ViewSize.X, ViewSize.Y, 1.0f/ViewSize.X, 1.0f/ViewSize.Y);
-
-			// 3. BufferSize (深度图全尺寸)
-			FVector2f BufferSize = FVector2f(SceneDepth->Desc.Extent.X, SceneDepth->Desc.Extent.Y);
-			PassParameters->ManualBufferSizeAndInvSize = FVector4f(BufferSize.X, BufferSize.Y, 1.0f/BufferSize.X, 1.0f/BufferSize.Y);
-
-			// 4. 矩阵 (注意 UE5 也是用 TranslatedWorld)
-			PassParameters->ManualSVPositionToTranslatedWorld = FMatrix44f(View.ViewMatrices.GetInvTranslatedViewProjectionMatrix()); 
-			PassParameters->ManualTranslatedWorldToClip = FMatrix44f(View.ViewMatrices.GetTranslatedViewProjectionMatrix());
-			
-			FIntVector GroupCount = FIntVector(
-				FMath::DivideAndRoundUp(SceneColorSlice.ViewRect.Width(), 8),
-				FMath::DivideAndRoundUp(SceneColorSlice.ViewRect.Height(), 8),
-				1
-			);
-
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("SSGI Raw Trace"),
-				ComputeShader,
-				PassParameters,
-				GroupCount
-			);
-		}
+		// Textures
+		PassParameters->HZBTexture = HZBTexture;
+		PassParameters->SceneColorTexture = SceneColorSlice.TextureSRV;
+		PassParameters->InputSceneDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneDepth));
 		
-		// [修改开始] Composite Pass 部分
-		FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice);
-		
-		FRDGTextureDesc OutputDesc = SceneColor.Texture->Desc;
-		// 确保有 UAV 标记，以便 CompositeCS 可以写入
-		OutputDesc.Flags |= TexCreate_UAV;
-		// 移除 RenderTargetable 等可能不需要的标记，避免验证错误 (可选，视情况而定)
-		OutputDesc.Flags &= ~(TexCreate_RenderTargetable | TexCreate_FastVRAM);
+		// GBuffer Binding
+		auto SceneTexturesParams = CreateSceneTextureUniformBuffer(GraphBuilder, View);
+		FRDGTextureRef Dummy = GSystemTextures.GetBlackDummy(GraphBuilder);
+		auto& StParams = SceneTexturesParams->GetParameters();
+		PassParameters->SSGI_GBufferA = StParams->GBufferATexture ? StParams->GBufferATexture : Dummy;
+		PassParameters->SSGI_GBufferB = StParams->GBufferBTexture ? StParams->GBufferBTexture : Dummy;
+		PassParameters->SSGI_GBufferC = StParams->GBufferCTexture ? StParams->GBufferCTexture : Dummy;
+		PassParameters->SSGI_GBufferD = StParams->GBufferDTexture ? StParams->GBufferDTexture : Dummy;
+		PassParameters->SSGI_GBufferE = StParams->GBufferETexture ? StParams->GBufferETexture : Dummy;
+		PassParameters->SSGI_GBufferF = StParams->GBufferFTexture ? StParams->GBufferFTexture : Dummy;
+		PassParameters->SSGI_GBufferVelocity = StParams->GBufferVelocityTexture ? StParams->GBufferVelocityTexture : Dummy;
 
-		FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("SSGI_Composite_Output"));
-		
-		{
-			TShaderMapRef<FSSGICompositeCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FSSGICompositeCS::FParameters* CompositeParams = GraphBuilder.AllocParameters<FSSGICompositeCS::FParameters>();
-			
-			CompositeParams->SceneColorTexture = SceneColor.Texture;
-			CompositeParams->SSGIResultTexture = SSGIOutputTexture;
-			CompositeParams->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
-			CompositeParams->ViewportSize = FVector2f(SceneColor.ViewRect.Width(), SceneColor.ViewRect.Height());
-			CompositeParams->DebugMode = DebugMode;
-			
-			FIntVector GroupCount = FIntVector(
-				FMath::DivideAndRoundUp(SceneColor.ViewRect.Width(), 8),
-				FMath::DivideAndRoundUp(SceneColor.ViewRect.Height(), 8),
-				1
-			);
+		// Settings
+		PassParameters->HZBSize = FVector4f(HZBTexture->Desc.Extent.X, HZBTexture->Desc.Extent.Y, 1.0f / HZBTexture->Desc.Extent.X, 1.0f / HZBTexture->Desc.Extent.Y);
+		PassParameters->MaxMipLevel = NumMips - 1;
+		PassParameters->MaxIterations = 64;
+		PassParameters->Thickness = 10.0f;
+		PassParameters->RayLength = 100.0f; // 调整为更合理的长度
+		PassParameters->Intensity = 5.0f;
+		PassParameters->DebugMode = CVarSSGIDebug.GetValueOnRenderThread();
+		PassParameters->SSGI_Raw_Output = GraphBuilder.CreateUAV(SSGIOutputTexture);
+		PassParameters->View = View.ViewUniformBuffer;
 
-			FComputeShaderUtils::AddPass(
-				GraphBuilder,
-				RDG_EVENT_NAME("Composite SSGI"),
-				ComputeShader,
-				CompositeParams,
-				GroupCount
-			);
-		}
+		// Manual View Data
+		PassParameters->ManualViewRectMin = FVector4f(SceneColorSlice.ViewRect.Min.X, SceneColorSlice.ViewRect.Min.Y, 0, 0);
+		FVector2f ViewSize(SceneColorSlice.ViewRect.Width(), SceneColorSlice.ViewRect.Height());
+		PassParameters->ManualViewSizeAndInvSize = FVector4f(ViewSize.X, ViewSize.Y, 1.0f/ViewSize.X, 1.0f/ViewSize.Y);
+		FVector2f BufferSize(SceneDepth->Desc.Extent.X, SceneDepth->Desc.Extent.Y);
+		PassParameters->ManualBufferSizeAndInvSize = FVector4f(BufferSize.X, BufferSize.Y, 1.0f/BufferSize.X, 1.0f/BufferSize.Y);
+		PassParameters->ManualSVPositionToTranslatedWorld = FMatrix44f(View.ViewMatrices.GetInvTranslatedViewProjectionMatrix()); 
+		PassParameters->ManualTranslatedWorldToClip = FMatrix44f(View.ViewMatrices.GetTranslatedViewProjectionMatrix());
 
-		// [核心修复] 将计算结果拷贝回 SceneColor，而不是返回新纹理
-		// 这样能确保与后续 PostProcess 管线的完美衔接
-		AddCopyTexturePass(GraphBuilder, OutputTexture, SceneColor.Texture);
-		
-		// 返回 SceneColor (它现在包含了 SSGI 的结果)
-		return SceneColor;
+		FIntVector GroupCount(FMath::DivideAndRoundUp(SceneColorSlice.ViewRect.Width(), 8), FMath::DivideAndRoundUp(SceneColorSlice.ViewRect.Height(), 8), 1);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("SSGI Trace"), ComputeShader, PassParameters, GroupCount);
 	}
 
-	return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
+	// 4. Composite Pass
+	FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice);
+	FRDGTextureDesc OutputDesc = SceneColor.Texture->Desc;
+	OutputDesc.Flags |= TexCreate_UAV;
+	OutputDesc.Flags &= ~(TexCreate_RenderTargetable | TexCreate_FastVRAM);
+	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("SSGI_Composite_Output"));
+	
+	{
+		TShaderMapRef<FSSGICompositeCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FSSGICompositeCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSSGICompositeCS::FParameters>();
+		
+		PassParameters->SceneColorTexture = SceneColor.Texture;
+		PassParameters->SSGIResultTexture = SSGIOutputTexture;
+		PassParameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
+		PassParameters->ViewportSize = FVector2f(SceneColor.ViewRect.Width(), SceneColor.ViewRect.Height());
+		PassParameters->DebugMode = CVarSSGIDebug.GetValueOnRenderThread();
+		
+		FIntVector GroupCount(FMath::DivideAndRoundUp(SceneColor.ViewRect.Width(), 8), FMath::DivideAndRoundUp(SceneColor.ViewRect.Height(), 8), 1);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("SSGI Composite"), ComputeShader, PassParameters, GroupCount);
+	}
+
+	AddCopyTexturePass(GraphBuilder, OutputTexture, SceneColor.Texture);
+	return SceneColor;
 }

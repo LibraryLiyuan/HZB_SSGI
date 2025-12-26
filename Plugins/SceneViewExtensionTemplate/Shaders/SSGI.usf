@@ -1,10 +1,10 @@
-﻿// [SSGI.usf]
+﻿// SSGI.usf
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/MonteCarlo.ush"
 #include "RayTracingCommon.ush"
 
-// [参数定义]
+// [Inputs]
 Texture2D HZBTexture;
 Texture2D SceneColorTexture;
 Texture2D InputSceneDepthTexture;
@@ -17,6 +17,7 @@ Texture2D SSGI_GBufferE;
 Texture2D SSGI_GBufferF;
 Texture2D SSGI_GBufferVelocity;
 
+// [Parameters]
 float4 HZBSize;
 int MaxMipLevel;
 int MaxIterations;
@@ -25,8 +26,17 @@ float RayLength;
 float Intensity;
 int DebugMode;
 
+// [Manual View Data]
+float4 ManualViewRectMin;
+float4 ManualViewSizeAndInvSize;
+float4 ManualBufferSizeAndInvSize;
+float4x4 ManualSVPositionToTranslatedWorld;
+float4x4 ManualTranslatedWorldToClip;
+
+// [Output]
 RWTexture2D<float4> SSGI_Raw_Output;
 
+// [Helpers]
 static uint3 RandState;
 void RandInit(uint2 PixelPos, uint FrameIndex, uint Seed)
 {
@@ -43,19 +53,14 @@ float Rand()
 
 float3 GetHeatmapColor(float Value)
 {
-    float3 Color = float3(0,0,1); // 0 = Blue
+    float3 Color = float3(0,0,1);
     if (Value > 0.25) Color = lerp(float3(0,0,1), float3(0,1,0), (Value - 0.25) * 4.0);
     if (Value > 0.5)  Color = lerp(float3(0,1,0), float3(1,1,0), (Value - 0.5) * 4.0);
     if (Value > 0.75) Color = lerp(float3(1,1,0), float3(1,0,0), (Value - 0.75) * 4.0);
     return Color;
 }
 
-float4 ManualViewRectMin;
-float4 ManualViewSizeAndInvSize;
-float4 ManualBufferSizeAndInvSize;
-float4x4 ManualSVPositionToTranslatedWorld;
-float4x4 ManualTranslatedWorldToClip;
-
+// [Custom GBuffer Decoding]
 float3 CustomOctahedralDecode(float2 Oct)
 {
     Oct = Oct * 2.0 - 1.0;
@@ -88,160 +93,157 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
     uint2 PixelPos = DispatchThreadID.xy;
     float2 ViewportSize = ManualViewSizeAndInvSize.xy;
-    
     float2 ScreenPos = float2(PixelPos) + ManualViewRectMin.xy + 0.5;
+    
     if (any(PixelPos >= uint2(ViewportSize))) return;
 
     float2 BufferUV = ScreenPos * ManualBufferSizeAndInvSize.zw;
 
+    // 1. 获取 GBuffer 数据
     FCustomGBufferData GBuffer = GetGBufferDataCustom(BufferUV);
     float3 WorldNormal = GBuffer.WorldNormal;
     float DeviceDepth = GBuffer.Depth;
 
     if (length(WorldNormal) < 0.1) WorldNormal = float3(0, 0, 1);
-
+    
+    // 如果是天空盒或者极远处，直接不计算
     if (DebugMode != 7 && DeviceDepth <= 0.00001f) 
     {
         SSGI_Raw_Output[PixelPos] = 0;
         return;
     }
 
-    // [删掉这行] 错误：不能直接把 PixelPos (ScreenPos) 传给逆投影矩阵
-    // float4 SvPosition = float4(ScreenPos, DeviceDepth, 1.0);
-    // float4 WorldPos4 = mul(SvPosition, ManualSVPositionToTranslatedWorld);
-
-    // ================= [核心修复] 坐标系转换 =================
-    // 我们的矩阵是 InvViewProjection，它期望输入是 Clip Space (NDC)
-    // 范围：X [-1, 1], Y [1, -1] (UE Y轴向上为+1, UV向下为+1)
-    
+    // 2. 重建世界坐标
     float2 NDC;
-    NDC.x = BufferUV.x * 2.0 - 1.0;       // 0..1 -> -1..1
-    NDC.y = 1.0 - BufferUV.y * 2.0;       // 0..1 -> 1..-1 (翻转Y)
+    NDC.x = BufferUV.x * 2.0 - 1.0;       
+    NDC.y = 1.0 - BufferUV.y * 2.0;
 
     float4 ClipPosition = float4(NDC, DeviceDepth, 1.0);
     float4 WorldPos4 = mul(ClipPosition, ManualSVPositionToTranslatedWorld);
     float3 WorldPos = WorldPos4.xyz / WorldPos4.w;
+    float3 BiasedWorldPos = WorldPos + WorldNormal * 2.0; // Bias
 
-    float3 BiasedWorldPos = WorldPos + WorldNormal * 2.0;
+    // 采样次数：如果不降噪，建议至少设为 4。
+    // 如果性能允许，可以设为 8 或 16（画面会很细腻，但很卡）
+    int NumSamples = 1; 
+    if (BufferUV.x > 0.5)
+    {
+        NumSamples = 16; // 右边跑 16 次
+    }
+    else
+    {
+        NumSamples = 1;  // 左边跑 1 次
+    }
+    
+    float3 AccumulatedColor = 0;
+    float ValidSamples = 0;
 
+    // 初始化随机种子基数
     uint LinearIndex = PixelPos.y * ViewportSize.x + PixelPos.x;
     RandInit(LinearIndex, View.StateFrameIndexMod8, LinearIndex * 114);
-    float2 RandE = float2(Rand(), Rand());
     
-    float3 LocalRayDir = CosineSampleHemisphere(RandE).xyz;
-    float3x3 TangentToWorld = GetTangentBasis(WorldNormal);
-    float3 WorldRayDir = mul(LocalRayDir, TangentToWorld);
-    float3 WorldRayEnd = BiasedWorldPos + WorldRayDir * RayLength;
-
-    // 1. View Space Clipping (防止投射到相机背后)
-    float4 ClipStart = mul(float4(BiasedWorldPos, 1.0), ManualTranslatedWorldToClip);
-    float4 ClipEnd   = mul(float4(WorldRayEnd, 1.0), ManualTranslatedWorldToClip);
-    
-    float NearPlane = 0.1; 
-    if (ClipEnd.w < NearPlane)
+    for (int i = 0; i < NumSamples; i++)
     {
-        float t = (NearPlane - ClipStart.w) / (ClipEnd.w - ClipStart.w);
-        t = clamp(t, 0.0, 0.999); 
-        ClipEnd = lerp(ClipStart, ClipEnd, t);
-    }
-    
-    if (ClipStart.w < 1e-4) 
-    { 
-        SSGI_Raw_Output[PixelPos] = 0;
-        return; 
-    }
+        float2 RandE = float2(Rand(), Rand());
+        
+        // 生成随机光线方向
+        float3 LocalRayDir = CosineSampleHemisphere(RandE).xyz;
+        float3x3 TangentToWorld = GetTangentBasis(WorldNormal);
+        float3 WorldRayDir = mul(LocalRayDir, TangentToWorld);
+        float3 WorldRayEnd = BiasedWorldPos + WorldRayDir * RayLength;
 
-    float3 ViewportStart = ClipStart.xyz / ClipStart.w;
-    float3 ViewportEnd   = ClipEnd.xyz / ClipEnd.w;
-    ViewportStart.xy = ViewportStart.xy * float2(0.5, -0.5) + 0.5;
-    ViewportEnd.xy   = ViewportEnd.xy   * float2(0.5, -0.5) + 0.5;
-
-    float2 UVScale = ManualViewSizeAndInvSize.xy * ManualBufferSizeAndInvSize.zw;
-    float2 UVOffset = ManualViewRectMin.xy * ManualBufferSizeAndInvSize.zw;
-
-    float3 BufferStart = ViewportStart;
-    BufferStart.xy = ViewportStart.xy * UVScale + UVOffset;
-    
-    float3 BufferEnd = ViewportEnd;
-    BufferEnd.xy = ViewportEnd.xy * UVScale + UVOffset;
-
-    float3 ScreenRayDir = BufferEnd - BufferStart;
-
-    // ================= [核心修复 2] 屏幕边缘裁剪 =================
-    // 解决 Debug 3 为红色的问题：如果光线射出屏幕，强行截断在屏幕边缘
-    // 这样 RayMarching 永远不会处理 > 1.0 的超长光线
-    float t_max = 1.0;
-    
-    // X轴裁剪 (0~1)
-    if (ScreenRayDir.x > 1e-6)       t_max = min(t_max, (1.0 - BufferStart.x) / ScreenRayDir.x);
-    else if (ScreenRayDir.x < -1e-6) t_max = min(t_max, (0.0 - BufferStart.x) / ScreenRayDir.x);
-    
-    // Y轴裁剪 (0~1)
-    if (ScreenRayDir.y > 1e-6)       t_max = min(t_max, (1.0 - BufferStart.y) / ScreenRayDir.y);
-    else if (ScreenRayDir.y < -1e-6) t_max = min(t_max, (0.0 - BufferStart.y) / ScreenRayDir.y);
-    
-    // 应用裁剪
-    ScreenRayDir *= t_max;
-    // ========================================================
-
-    FHiZTraceInput TraceInput;
-    TraceInput.RayOrigin = BufferStart;
-    TraceInput.RayDirection = ScreenRayDir; 
-    TraceInput.HZBTexture = HZBTexture;
-    TraceInput.HZBSize = HZBSize;
-    TraceInput.MaxMipLevel = MaxMipLevel;
-    
-    // [强制保护] 确保迭代次数不为0
-    TraceInput.MaxIterations = (MaxIterations <= 0) ? 64 : MaxIterations;
-    
-    TraceInput.Thickness = (Thickness < 0.1) ? 10.0 : Thickness; 
-    
-    FHiZTraceResult TraceResult = HiZTrace(TraceInput);
-
-    // ================= [恢复原始 Debug 逻辑] =================
-    if (DebugMode != 0)
-    {
-        float4 DebugColor = float4(0,0,0,1);
-
-        if (DebugMode == 1) // [热力图]
+        // 投影与裁剪
+        float4 ClipStart = mul(float4(BiasedWorldPos, 1.0), ManualTranslatedWorldToClip);
+        float4 ClipEnd   = mul(float4(WorldRayEnd, 1.0), ManualTranslatedWorldToClip);
+        
+        float NearPlane = 0.1;
+        if (ClipEnd.w < NearPlane)
         {
-            // 如果还是一片蓝，说明 Iterations 真的很少
-            // 如果看到红色/黄色，说明光线终于跑起来了！
-            float Ratio = TraceResult.Iterations / float(TraceInput.MaxIterations);
-            DebugColor.rgb = GetHeatmapColor(Ratio);
-            if (TraceResult.bHit) DebugColor.rgb += 0.2; // 命中变亮
+            float t = (NearPlane - ClipStart.w) / (ClipEnd.w - ClipStart.w);
+            t = clamp(t, 0.0, 0.999); 
+            ClipEnd = lerp(ClipStart, ClipEnd, t);
         }
-        else if (DebugMode == 2) // [击中 UV]
-        {
-            if (TraceResult.bHit) DebugColor = float4(TraceResult.HitUVz.xy, 0, 1);
-            else DebugColor = float4(0.2, 0.2, 0.2, 1); 
-        }
-        else if (DebugMode == 3) // [检查光线方向]
-        {
-            // 绿色 = 短光线, 黄色 = 长光线
-            // 现在不应该看到纯红了，因为我们做了裁剪
-            float Len = length(ScreenRayDir.xy);
-            DebugColor = float4(Len, Len, 0, 1); 
-        }
-        else if (DebugMode == 4) DebugColor.rgb = HZBTexture.SampleLevel(GlobalPointClampedSampler, BufferUV, 0).rrr;
-        else if (DebugMode == 5) DebugColor.rgb = frac(WorldPos * 0.01);
-        else if (DebugMode == 6) DebugColor.rgb = float3(ViewportStart.xy, 0);
-        else if (DebugMode == 7) DebugColor.rgb = (DeviceDepth > 0.00001) ? float3(1, 0, 0) : 0;
+        
+        // 如果起点都在背面，这次采样作废，继续下一次
+        if (ClipStart.w < 1e-4) continue;
 
-        SSGI_Raw_Output[PixelPos] = DebugColor;
-        return;
-    }
+        float3 ViewportStart = ClipStart.xyz / ClipStart.w;
+        float3 ViewportEnd   = ClipEnd.xyz / ClipEnd.w;
+        ViewportStart.xy = ViewportStart.xy * float2(0.5, -0.5) + 0.5;
+        ViewportEnd.xy   = ViewportEnd.xy   * float2(0.5, -0.5) + 0.5;
 
-    float4 OutColor = 0;
-    if (TraceResult.bHit)
-    {
-        float2 HitBufferUV = TraceResult.HitUVz.xy;
-        // 边界检查
-        if (all(HitBufferUV >= 0.0) && all(HitBufferUV <= 1.0))
+        float2 UVScale = ManualViewSizeAndInvSize.xy * ManualBufferSizeAndInvSize.zw;
+        float2 UVOffset = ManualViewRectMin.xy * ManualBufferSizeAndInvSize.zw;
+
+        float3 BufferStart = ViewportStart;
+        BufferStart.xy = ViewportStart.xy * UVScale + UVOffset;
+        float3 BufferEnd = ViewportEnd;
+        BufferEnd.xy = ViewportEnd.xy * UVScale + UVOffset;
+        float3 ScreenRayDir = BufferEnd - BufferStart;
+
+        // 屏幕边缘裁剪
+        float t_max = 1.0;
+        if (ScreenRayDir.x > 1e-6)       t_max = min(t_max, (1.0 - BufferStart.x) / ScreenRayDir.x);
+        else if (ScreenRayDir.x < -1e-6) t_max = min(t_max, (0.0 - BufferStart.x) / ScreenRayDir.x);
+        if (ScreenRayDir.y > 1e-6)       t_max = min(t_max, (1.0 - BufferStart.y) / ScreenRayDir.y);
+        else if (ScreenRayDir.y < -1e-6) t_max = min(t_max, (0.0 - BufferStart.y) / ScreenRayDir.y);
+        ScreenRayDir *= t_max;
+
+        // 执行追踪
+        FHiZTraceInput TraceInput;
+        TraceInput.RayOrigin = BufferStart;
+        TraceInput.RayDirection = ScreenRayDir; 
+        TraceInput.HZBTexture = HZBTexture;
+        TraceInput.HZBSize = HZBSize;
+        TraceInput.MaxMipLevel = MaxMipLevel;
+        TraceInput.MaxIterations = (MaxIterations <= 0) ? 64 : MaxIterations;
+        TraceInput.Thickness = (Thickness < 0.1) ? 10.0 : Thickness; 
+        
+        FHiZTraceResult TraceResult = HiZTrace(TraceInput);
+
+        // Debug 模式下我们只显示第一次采样的结果，否则热力图会叠加乱掉
+        if (DebugMode != 0 && i == 0)
         {
-            float3 HitColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, HitBufferUV, 0).rgb;
-            OutColor = float4(HitColor * Intensity, 1.0);
+             float4 DebugColor = float4(0,0,0,1);
+             if (DebugMode == 1) 
+             {
+                 float Ratio = TraceResult.Iterations / float(TraceInput.MaxIterations);
+                 DebugColor.rgb = GetHeatmapColor(Ratio);
+                 if (TraceResult.bHit) DebugColor.rgb += 0.2; 
+             }
+             else if (DebugMode == 2) 
+             {
+                 if (TraceResult.bHit) DebugColor = float4(TraceResult.HitUVz.xy, 0, 1);
+                 else DebugColor = float4(0.2, 0.2, 0.2, 1); 
+             }
+             else if (DebugMode == 3)
+             {
+                 float Len = length(ScreenRayDir.xy);
+                 DebugColor = float4(Len, Len, 0, 1); 
+             }
+             else if (DebugMode == 4) DebugColor.rgb = HZBTexture.SampleLevel(GlobalPointClampedSampler, BufferUV, 0).rrr;
+             else if (DebugMode == 5) DebugColor.rgb = frac(WorldPos * 0.01);
+             else if (DebugMode == 6) DebugColor.rgb = float3(ViewportStart.xy, 0);
+             else if (DebugMode == 7) DebugColor.rgb = (DeviceDepth > 0.00001) ? float3(1, 0, 0) : 0;
+             
+             SSGI_Raw_Output[PixelPos] = DebugColor;
+             return;
+        }
+
+        // 累加颜色
+        if (TraceResult.bHit)
+        {
+            float2 HitBufferUV = TraceResult.HitUVz.xy;
+            if (all(HitBufferUV >= 0.0) && all(HitBufferUV <= 1.0))
+            {
+                float3 HitColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, HitBufferUV, 0).rgb;
+                AccumulatedColor += HitColor;
+                ValidSamples += 1.0;
+            }
         }
     }
-    SSGI_Raw_Output[PixelPos] = OutColor;
+    float3 FinalColor = (ValidSamples > 0.0) ? (AccumulatedColor / float(NumSamples)) : float3(0,0,0);
+    
+    // 应用强度
+    SSGI_Raw_Output[PixelPos] = float4(FinalColor * Intensity, 1.0);
 }
