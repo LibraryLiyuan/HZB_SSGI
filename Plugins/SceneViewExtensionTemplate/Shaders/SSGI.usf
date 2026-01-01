@@ -4,42 +4,63 @@
 #include "/Engine/Private/MonteCarlo.ush"
 #include "RayTracingCommon.ush"
 
-// [Inputs]
+// HZB 纹理：包含场景深度的 Mipmap 链 (用于加速光线追踪)
 Texture2D HZBTexture;
+// 场景颜色：包含上一帧或当前帧已渲染的颜色 (用于获取反射后的颜色)
 Texture2D SceneColorTexture;
+// 场景深度：全分辨率深度图 (用于重构世界坐标)
 Texture2D InputSceneDepthTexture;
 
 Texture2D SSGI_GBufferA;
-Texture2D SSGI_GBufferB;
-Texture2D SSGI_GBufferC;
-Texture2D SSGI_GBufferD;
-Texture2D SSGI_GBufferE;
-Texture2D SSGI_GBufferF;
-Texture2D SSGI_GBufferVelocity;
+Texture2D SSGI_GBufferVelocity; // 速度矢量 (虽然这里声明了，但在 Trace 阶段通常不用，Temporal 阶段才用)
 
-// [Parameters]
-float4 HZBSize;
-int MaxMipLevel;
-int MaxIterations;
-float Thickness;
-float RayLength;
-float Intensity;
-int DebugMode;
-int FrameIndex; // [新增]
+// -----------------------------------------------------------------------------
+// [参数设置] 由 C++ 端传入
+// -----------------------------------------------------------------------------
+float4 HZBSize;      // HZB 纹理尺寸信息 (xy=Size, zw=InvSize)
+int MaxMipLevel;     // HZB 的最大 Mip 层级
+int MaxIterations;   // 光线追踪最大步进次数
+float Thickness;     // 表面厚度假设 (用于判断命中)
+float RayLength;     // 光线最大追踪距离 (厘米)
+float Intensity;     // SSGI 强度倍率
+//int DebugMode;     // (已注释) 调试模式开关
+int FrameIndex;      // 当前帧序号 (用于时间抖动，Temporal Dithering)
 
-// [Manual View Data]
-float4 ManualViewRectMin;
-float4 ManualViewSizeAndInvSize;
-float4 ManualBufferSizeAndInvSize;
-float4x4 ManualSVPositionToTranslatedWorld;
-float4x4 ManualTranslatedWorldToClip;
+// -----------------------------------------------------------------------------
+// [视口与坐标系参数] 核心！
+// -----------------------------------------------------------------------------
+// 全局纹理偏移：视口左上角在 GBuffer 纹理中的像素坐标
+// 在编辑器中，Viewport 往往只是整个 RenderTarget 的一部分，必须加上这个偏移
+float4 ViewRectMin;
 
-// [Output]
+// 视口尺寸：当前渲染画面的大小 (Local UV = Pixel / ViewSize)
+float4 ViewSizeAndInvSize;
+
+// 缓冲尺寸：整个纹理的大小 (Global UV = (Pixel + ViewRectMin) / BufferSize)
+float4 BufferSizeAndInvSize;
+
+// 矩阵：用于在 NDC 和 World Space (世界空间) 之间转换
+float4x4 SVPositionToTranslatedWorld; // 屏幕像素 -> 世界坐标
+float4x4 TranslatedWorldToClip;       // 世界坐标 -> 屏幕像素
+
+// -----------------------------------------------------------------------------
+// [输出]
+// -----------------------------------------------------------------------------
 RWTexture2D<float4> SSGI_Raw_Output;
 
+// -----------------------------------------------------------------------------
+// [随机数生成器] PCG Hash (Permuted Congruential Generator)
+// -----------------------------------------------------------------------------
 static uint3 RandState;
 
-// 使用 PCG 风格的哈希函数，它比线性组合更能打散数据，消除条纹
+struct FCustomGBufferData
+{
+    float3 WorldNormal;
+    float Depth;
+};
+
+// PCG 哈希函数：将输入整数打乱，生成高质量的伪随机数
+// 相比传统的 sin/cos 随机，它在 GPU 上更快且没有周期性纹理
 uint Hash(uint x)
 {
     x = ((x >> 16) ^ x) * 0x45d9f3b;
@@ -48,39 +69,52 @@ uint Hash(uint x)
     return x;
 }
 
+// 初始化随机状态
 void RandInit(uint2 PixelPos, uint FrameIndex, uint Seed)
 {
-    // 1. 将所有输入组合成一个基础种子
-    // 使用位移和异或来确保每个位的变化都能影响最终结果
+    // 1. 空间差异：不同像素拥有不同的随机种子
     uint CombinedSeed = PixelPos.x + (PixelPos.y << 16);
     
-    // 2. 依次混入 FrameIndex (让噪点随时间跳动) 和 Seed (让多次采样互不相关)
+    // 2. 时间差异：混入 FrameIndex
+    // 这使得同一像素在不同帧生成的噪点模式不同，
+    // 从而让 TAA (Temporal Anti-Aliasing) 或我们的 Temporal Pass 能够通过时间平均来消除噪点。
     CombinedSeed = Hash(CombinedSeed ^ Hash(FrameIndex));
+    
+    // 3. 采样差异：单帧内的多次采样也需要不同种子
     CombinedSeed = Hash(CombinedSeed ^ Hash(Seed));
 
-    // 3. 初始化状态
+    // 初始化内部状态向量
     RandState.x = CombinedSeed;
     RandState.y = Hash(CombinedSeed + 1);
     RandState.z = Hash(CombinedSeed + 2);
 }
 
+// 生成 [0, 1] 范围的随机浮点数
 float Rand()
 {
-    // 简单的 LCG 迭代
+    // LCG (Linear Congruential Generator) 迭代
     RandState.x = (RandState.x * 1664525 + 1013904223);
+    // 除以 2^32 归一化
     return float(RandState.x) / 4294967296.0;
 }
 
+// -----------------------------------------------------------------------------
+// [Debug 工具] 热力图生成 (用于调试 Iterations)
+// -----------------------------------------------------------------------------
 float3 GetHeatmapColor(float Value)
 {
-    float3 Color = float3(0,0,1);
+    float3 Color = float3(0,0,1); // 蓝色 (冷/低消耗)
     if (Value > 0.25) Color = lerp(float3(0,0,1), float3(0,1,0), (Value - 0.25) * 4.0);
     if (Value > 0.5)  Color = lerp(float3(0,1,0), float3(1,1,0), (Value - 0.5) * 4.0);
-    if (Value > 0.75) Color = lerp(float3(1,1,0), float3(1,0,0), (Value - 0.75) * 4.0);
+    if (Value > 0.75) Color = lerp(float3(1,1,0), float3(1,0,0), (Value - 0.75) * 4.0); // 红色 (热/高消耗)
     return Color;
 }
 
-// [Custom GBuffer Decoding]
+// -----------------------------------------------------------------------------
+// [GBuffer 解码]
+// -----------------------------------------------------------------------------
+// 八面体解码 (Octahedral Decode)：将 2 个分量解压为 3 个分量的单位法线
+// UE5 为了节省显存带宽，GBufferA 通常只存储法线的投影坐标 (RG通道)
 float3 CustomOctahedralDecode(float2 Oct)
 {
     Oct = Oct * 2.0 - 1.0;
@@ -93,17 +127,14 @@ float3 CustomOctahedralDecode(float2 Oct)
     return normalize(N);
 }
 
-struct FCustomGBufferData
-{
-    float3 WorldNormal;
-    float Depth;
-};
-
-FCustomGBufferData GetGBufferDataCustom(float2 UV)
+// 获取当前像素的几何信息
+FCustomGBufferData GetGBufferDataCustom(float2 BufferUV)
 {
     FCustomGBufferData Out;
-    Out.Depth = InputSceneDepthTexture.SampleLevel(GlobalPointClampedSampler, UV, 0).r;
-    float4 GBufferA = SSGI_GBufferA.SampleLevel(GlobalPointClampedSampler, UV, 0);
+    // 采样深度 (DeviceZ)
+    Out.Depth = InputSceneDepthTexture.SampleLevel(GlobalPointClampedSampler, BufferUV, 0).r;
+    // 采样并解码法线
+    float4 GBufferA = SSGI_GBufferA.SampleLevel(GlobalPointClampedSampler, BufferUV, 0);
     Out.WorldNormal = CustomOctahedralDecode(GBufferA.xy);
     return Out;
 }
@@ -111,98 +142,146 @@ FCustomGBufferData GetGBufferDataCustom(float2 UV)
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
 void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
+    // PixelPos: 当前线程处理的像素坐标 (相对于 ViewRectMin 的局部坐标)
     uint2 PixelPos = DispatchThreadID.xy;
-    float2 ViewportSize = ManualViewSizeAndInvSize.xy;
-    float2 ScreenPos = float2(PixelPos) + ManualViewRectMin.xy + 0.5;
+    float2 ViewportSize = ViewSizeAndInvSize.xy;
     
+    // ScreenPos: 加上偏移后的绝对像素坐标 (用于计算 BufferUV)
+    float2 ScreenPos = float2(PixelPos) + ViewRectMin.xy + 0.5;
+    
+    // 越界检查 (View 空间)
     if (any(PixelPos >= uint2(ViewportSize))) return;
 
-    float2 BufferUV = ScreenPos * ManualBufferSizeAndInvSize.zw;
+    // 计算全局 Buffer UV (用于采样 GBuffer/Depth)
+    float2 BufferUV = ScreenPos * BufferSizeAndInvSize.zw;
 
-    // 1. 获取 GBuffer 数据
+    // -------------------------------------------------------------------------
+    // 1. GBuffer 数据读取与世界坐标重构
+    // -------------------------------------------------------------------------
     FCustomGBufferData GBuffer = GetGBufferDataCustom(BufferUV);
     float3 WorldNormal = GBuffer.WorldNormal;
     float DeviceDepth = GBuffer.Depth;
 
+    // 简单的法线有效性检查 (防止非法法线导致 NaN)
     if (length(WorldNormal) < 0.1) WorldNormal = float3(0, 0, 1);
     
-    // 如果是天空盒或者极远处，直接不计算
-    if (DebugMode != 7 && DeviceDepth <= 0.00001f) 
+    // 深度测试：如果是天空盒 (Far Plane) 或极远处，不计算 SSGI
+    if (DeviceDepth <= 0.00001f) // Reverse-Z: 0 是无穷远
     {
         SSGI_Raw_Output[PixelPos] = 0;
         return;
     }
-
-    // 2. 重建世界坐标
+    
+    // 计算 View UV (Local 0-1) 用于 NDC 计算
+    float2 ViewUV = (float2(PixelPos) + 0.5) * ViewSizeAndInvSize.zw;
+    
+    // 构建 NDC (Normalized Device Coordinates)
+    // 注意：UE 的 NDC Y 轴是朝上的，而 UV Y 轴通常朝下，这里做了翻转
     float2 NDC;
-    NDC.x = BufferUV.x * 2.0 - 1.0;       
-    NDC.y = 1.0 - BufferUV.y * 2.0;
+    NDC.x = ViewUV.x * 2.0 - 1.0; 
+    NDC.y = 1.0 - ViewUV.y * 2.0;
 
+    // 从深度重构世界坐标 (Reconstruct World Position)
+    // SVPositionToTranslatedWorld 矩阵将 (NDC_X, NDC_Y, DeviceZ, 1) 变换回 World Space
     float4 ClipPosition = float4(NDC, DeviceDepth, 1.0);
-    float4 WorldPos4 = mul(ClipPosition, ManualSVPositionToTranslatedWorld);
-    float3 WorldPos = WorldPos4.xyz / WorldPos4.w;
-    float3 BiasedWorldPos = WorldPos + WorldNormal * 2.0; // Bias
+    float4 WorldPos4 = mul(ClipPosition, SVPositionToTranslatedWorld);
+    float3 WorldPos = WorldPos4.xyz / WorldPos4.w; // 透视除法
 
-    // 采样次数：如果不降噪，建议至少设为 4。
-    // 如果性能允许，可以设为 8 或 16（画面会很细腻，但很卡）
-    int NumSamples = 1; 
+    // [Self-Intersection Bias]
+    // 将起点沿着法线方向稍微推一点点，防止光线直接打中出发点自己 (造成黑色斑点)
+    float3 BiasedWorldPos = WorldPos + WorldNormal * 2.0; 
     
+    // -------------------------------------------------------------------------
+    // 2. 蒙特卡洛积分循环 (Monte Carlo Integration)
+    // -------------------------------------------------------------------------
+    // NumSamples: 每像素采样光线数。
+    // 因为我们有强大的降噪器，通常 1 SPP (Sample Per Pixel) 就足够了。
+    int NumSamples = 1;
     float3 AccumulatedColor = 0;
-    float ValidSamples = 0;
+    float ValidSamples = 0; // 记录成功命中的采样数
 
-    // 初始化随机种子基数
-    //uint LinearIndex = PixelPos.y * ViewportSize.x + PixelPos.x;
-    
-    
+    // 用于裁剪光线追踪范围的 UV 边界
+    float2 ValidUVMin;
+    float2 ValidUVMax;
+
     for (int i = 0; i < NumSamples; i++)
     {
+        // 初始化随机数 (每个采样、每帧都不同)
         RandInit(PixelPos, FrameIndex, i);
         float2 RandE = float2(Rand(), Rand());
         
-        // 生成随机光线方向
+        // [生成光线] Cosine Weighted Sampling (余弦加权采样)
+        // 对于漫反射表面，光线更有可能沿着法线方向反弹。
+        // 使用重要性采样可以大幅减少噪点，因为它把光线集中在贡献最大的方向。
         float3 LocalRayDir = CosineSampleHemisphere(RandE).xyz;
+        
+        // 构建 TBN 矩阵 (Tangent, Bitangent, Normal) 将局部光线转到世界空间
         float3x3 TangentToWorld = GetTangentBasis(WorldNormal);
         float3 WorldRayDir = mul(LocalRayDir, TangentToWorld);
+        
+        // 计算光线终点
         float3 WorldRayEnd = BiasedWorldPos + WorldRayDir * RayLength;
 
-        // 投影与裁剪
-        float4 ClipStart = mul(float4(BiasedWorldPos, 1.0), ManualTranslatedWorldToClip);
-        float4 ClipEnd   = mul(float4(WorldRayEnd, 1.0), ManualTranslatedWorldToClip);
+        // ---------------------------------------------------------------------
+        // 3. 投影与裁剪 (Projection & Clipping)
+        // ---------------------------------------------------------------------
+        // 将世界空间的光线转换回屏幕空间 (Clip Space)
+        float4 ClipStart = mul(float4(BiasedWorldPos, 1.0), TranslatedWorldToClip);
+        float4 ClipEnd   = mul(float4(WorldRayEnd, 1.0), TranslatedWorldToClip);
         
+        // [近平面裁剪] 防止光线跑到相机后面导致除法错误或反向投影
         float NearPlane = 0.1;
         if (ClipEnd.w < NearPlane)
         {
+            // 如果终点在相机后面，将终点截断在近平面上
             float t = (NearPlane - ClipStart.w) / (ClipEnd.w - ClipStart.w);
             t = clamp(t, 0.0, 0.999); 
             ClipEnd = lerp(ClipStart, ClipEnd, t);
         }
         
-        // 如果起点都在背面，这次采样作废，继续下一次
+        // 如果起点本身就在相机背面，直接放弃这条光线
         if (ClipStart.w < 1e-4) continue;
 
+        // 透视除法 -> Screen Space (NDC)
         float3 ViewportStart = ClipStart.xyz / ClipStart.w;
         float3 ViewportEnd   = ClipEnd.xyz / ClipEnd.w;
+
+        // NDC (-1~1) -> UV (0~1)
         ViewportStart.xy = ViewportStart.xy * float2(0.5, -0.5) + 0.5;
         ViewportEnd.xy   = ViewportEnd.xy   * float2(0.5, -0.5) + 0.5;
 
-        float2 UVScale = ManualViewSizeAndInvSize.xy * ManualBufferSizeAndInvSize.zw;
-        float2 UVOffset = ManualViewRectMin.xy * ManualBufferSizeAndInvSize.zw;
+        // [坐标系转换] Viewport UV -> Global Buffer UV
+        // 必须加上 ViewRectMin 偏移，并缩放到 Buffer 尺寸
+        float2 UVScale = ViewSizeAndInvSize.xy * BufferSizeAndInvSize.zw;
+        float2 UVOffset = ViewRectMin.xy * BufferSizeAndInvSize.zw;
 
         float3 BufferStart = ViewportStart;
         BufferStart.xy = ViewportStart.xy * UVScale + UVOffset;
         float3 BufferEnd = ViewportEnd;
         BufferEnd.xy = ViewportEnd.xy * UVScale + UVOffset;
+
+        // 计算屏幕空间的光线方向向量
         float3 ScreenRayDir = BufferEnd - BufferStart;
 
-        // 屏幕边缘裁剪
+        // [视口边界计算]
+        // 极其重要：限制光线只能在当前 ViewRect 对应的 Buffer 区域内采样
+        // 否则会采样到 Texture 中的无效区域 (黑边) 或其他 View 的内容
+        ValidUVMin = UVOffset;
+        ValidUVMax = UVOffset + UVScale;
+
+        // [光线截断]
+        // 如果光线射出了 ValidUVMin/Max 定义的矩形，将其截断在边界上
         float t_max = 1.0;
-        if (ScreenRayDir.x > 1e-6)       t_max = min(t_max, (1.0 - BufferStart.x) / ScreenRayDir.x);
-        else if (ScreenRayDir.x < -1e-6) t_max = min(t_max, (0.0 - BufferStart.x) / ScreenRayDir.x);
-        if (ScreenRayDir.y > 1e-6)       t_max = min(t_max, (1.0 - BufferStart.y) / ScreenRayDir.y);
-        else if (ScreenRayDir.y < -1e-6) t_max = min(t_max, (0.0 - BufferStart.y) / ScreenRayDir.y);
+        if (ScreenRayDir.x > 1e-6)       t_max = min(t_max, (ValidUVMax.x - BufferStart.x) / ScreenRayDir.x);
+        else if (ScreenRayDir.x < -1e-6) t_max = min(t_max, (ValidUVMin.x - BufferStart.x) / ScreenRayDir.x);
+        if (ScreenRayDir.y > 1e-6)       t_max = min(t_max, (ValidUVMax.y - BufferStart.y) / ScreenRayDir.y);
+        else if (ScreenRayDir.y < -1e-6) t_max = min(t_max, (ValidUVMin.y - BufferStart.y) / ScreenRayDir.y);
+        
         ScreenRayDir *= t_max;
 
-        // 执行追踪
+        // ---------------------------------------------------------------------
+        // 4. 执行 HZB 追踪 (调用 RayTracingCommon.ush)
+        // ---------------------------------------------------------------------
         FHiZTraceInput TraceInput;
         TraceInput.RayOrigin = BufferStart;
         TraceInput.RayDirection = ScreenRayDir; 
@@ -211,58 +290,48 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
         TraceInput.MaxMipLevel = MaxMipLevel;
         TraceInput.MaxIterations = (MaxIterations <= 0) ? 64 : MaxIterations;
         TraceInput.Thickness = (Thickness < 0.1) ? 10.0 : Thickness; 
+        TraceInput.ValidUVMin = ValidUVMin;
+        TraceInput.ValidUVMax = ValidUVMax;
         
         FHiZTraceResult TraceResult = HiZTrace(TraceInput);
 
-        // Debug 模式下我们只显示第一次采样的结果，否则热力图会叠加乱掉
-        if (DebugMode != 0 && i == 0)
-        {
-             float4 DebugColor = float4(0,0,0,1);
-             if (DebugMode == 1) 
-             {
-                 float Ratio = TraceResult.Iterations / float(TraceInput.MaxIterations);
-                 DebugColor.rgb = GetHeatmapColor(Ratio);
-                 if (TraceResult.bHit) DebugColor.rgb += 0.2; 
-             }
-             else if (DebugMode == 2) 
-             {
-                 if (TraceResult.bHit) DebugColor = float4(TraceResult.HitUVz.xy, 0, 1);
-                 else DebugColor = float4(0.2, 0.2, 0.2, 1); 
-             }
-             else if (DebugMode == 3)
-             {
-                 float Len = length(ScreenRayDir.xy);
-                 DebugColor = float4(Len, Len, 0, 1); 
-             }
-             else if (DebugMode == 4) DebugColor.rgb = HZBTexture.SampleLevel(GlobalPointClampedSampler, BufferUV, 0).rrr;
-             else if (DebugMode == 5) DebugColor.rgb = frac(WorldPos * 0.01);
-             else if (DebugMode == 6) DebugColor.rgb = float3(ViewportStart.xy, 0);
-             else if (DebugMode == 7) DebugColor.rgb = (DeviceDepth > 0.00001) ? float3(1, 0, 0) : 0;
-             
-             SSGI_Raw_Output[PixelPos] = DebugColor;
-             return;
-        }
+        // (调试代码块已省略，保持逻辑清洁)
 
-        // 累加颜色
+        // ---------------------------------------------------------------------
+        // 5. 颜色累积
+        // ---------------------------------------------------------------------
         if (TraceResult.bHit)
         {
             float2 HitBufferUV = TraceResult.HitUVz.xy;
+            // 二次确认命中点是否在合法范围内
             if (all(HitBufferUV >= 0.0) && all(HitBufferUV <= 1.0))
             {
+                // 采样命中点的场景颜色 (作为入射光)
                 float3 HitColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, HitBufferUV, 0).rgb;
+                
+                // [Firefly Clamp / 萤火虫抑制]
+                // 这是一个非常实用的工程技巧。
+                // 如果采样到了极亮的光源 (比如强度 1000 的自发光)，这个单一采样点会产生巨大的噪点。
+                // 我们通过限制单次采样的最大亮度，以能量准确性换取画面稳定性。
                 float MaxBrightness = 10.0;
-                float Luma = dot(HitColor, float3(0.2126, 0.7152, 0.0722));
+                float Luma = dot(HitColor, float3(0.2126, 0.7152, 0.0722)); // 计算亮度
                 if (Luma > MaxBrightness)
                 {
-                    HitColor *= (MaxBrightness / Luma);
+                    HitColor *= (MaxBrightness / Luma); // 缩放颜色使其亮度不超过 Max
                 }
+
+                // 累加颜色
+                // 注意：这里没有乘 BRDF 项 (albedo / pi)，因为我们假设是纯漫反射，
+                // 且 SSGI 通常作为 irradiance map 叠加。如果需要更物理的效果，应在这里乘上 albedo。
                 AccumulatedColor += HitColor;
                 ValidSamples += 1.0;
             }
         }
     }
+
+    // 计算平均值
     float3 FinalColor = (ValidSamples > 0.0) ? (AccumulatedColor / float(NumSamples)) : float3(0,0,0);
     
-    // 应用强度
+    // 应用强度并输出
     SSGI_Raw_Output[PixelPos] = float4(FinalColor * Intensity, 1.0);
 }

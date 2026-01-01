@@ -4,17 +4,17 @@
 
 struct FHiZTraceInput
 {
+	// 屏幕空间坐标系下的光线起点
 	float3 RayOrigin;
 	float3 RayDirection;
-
 	Texture2D HZBTexture;
-	// xy: Size, zw: InvSize
 	float4 HZBSize; 
-
 	int MaxMipLevel;
 	int MaxIterations;
-	// 单位：厘米
-	float Thickness; 
+	// 用于判断是否穿透到物体后面
+	float Thickness;
+	float2 ValidUVMin;
+	float2 ValidUVMax;
 };
 
 struct FHiZTraceResult
@@ -38,7 +38,7 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 
 	float3 CurrentPos = Input.RayOrigin;
 	float3 RayDir = Input.RayDirection;
-
+	// AABB相交测试
 	float3 InvRayDir;
 	InvRayDir.x = (abs(RayDir.x) < 1e-6) ? 1e6 : 1.0 / RayDir.x;
 	InvRayDir.y = (abs(RayDir.y) < 1e-6) ? 1e6 : 1.0 / RayDir.y;
@@ -54,21 +54,23 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 		float2 CellCount = GetCellCount(CurrentMip, Input.HZBSize);
 		float2 CellSize = 1.0 / CellCount;
 		float2 CellUV = (floor(CurrentPos.xy * CellCount) + 0.5) * CellSize;
-		
+		// 当前HZB深度
 		float HZB_DeviceZ = Input.HZBTexture.SampleLevel(GlobalPointClampedSampler, CellUV, CurrentMip).r;
+		// 深度偏差，防止 Z-Fighting
 		const float DepthEpsilon = 0.0001;
 
-		// 比较深度 (Reverse-Z)
 		if (CurrentPos.z < HZB_DeviceZ + DepthEpsilon) 
 		{
 			if (CurrentMip == 0)
 			{
-				// 线性深度比较 (Linear Depth Test)
+				// 将 DeviceZ (非线性) 转为 LinearDepth (线性，单位：厘米)
+				// ConvertFromDeviceZ 是 UE Common.ush 里的函数
 				float Linear_HZB = ConvertFromDeviceZ(HZB_DeviceZ);
 				float Linear_Ray = ConvertFromDeviceZ(CurrentPos.z);
+				
 				float DistDiff = Linear_Ray - Linear_HZB;
 
-				// 命中判定：在表面后方，且在厚度范围内
+				// 注意需要判断是否穿透了
 				if (DistDiff > 0.0 && DistDiff < Input.Thickness)
 				{
 					Result.bHit = true;
@@ -78,31 +80,30 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 				}
 				else
 				{
-					// 未命中：穿透太深或误差，视为未遮挡，继续步进
 					Result.bHit = false;
 				}
 			}
 			else
 			{
-				// 降级 Mip
+				// 重新开始循环，在更细的层级检查
 				CurrentMip--;
 				continue;
 			}
 		}
-
-		// Ray Marching: 步进到下一个格子
+		
 		{
 			float2 CurrentCellIdx = floor(CurrentPos.xy * CellCount);
+			// 计算光线的步进距离
 			float2 BoundaryUV = (CurrentCellIdx + float2(RayDir.x > 0 ? 1.0 : 0.0, RayDir.y > 0 ? 1.0 : 0.0)) * CellSize;
 			float2 T_Boundary = (BoundaryUV - CurrentPos.xy) * InvRayDir.xy;
 			float StepT = min(T_Boundary.x, T_Boundary.y) + 0.0001;
 
+			// 更新光线位置
 			CurrentPos += RayDir * StepT;
 			CurrentMip = min(CurrentMip + 1, Input.MaxMipLevel);
 		}
 
-		// 越界检查
-		if (any(CurrentPos.xy < 0.0) || any(CurrentPos.xy > 1.0) || CurrentPos.z < 0.0001)
+		if (any(CurrentPos.xy < Input.ValidUVMin) || any(CurrentPos.xy > Input.ValidUVMax) || CurrentPos.z < 0.0001)
 		{
 			break;
 		}

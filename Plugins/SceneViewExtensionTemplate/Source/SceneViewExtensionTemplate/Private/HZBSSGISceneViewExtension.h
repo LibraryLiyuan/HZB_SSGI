@@ -61,11 +61,6 @@ public:
 		
 		// GBuffer Textures
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferA)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferB)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferC)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferD)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferE)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferF)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferVelocity)
 
 		// Settings
@@ -75,18 +70,18 @@ public:
 		SHADER_PARAMETER(float, Thickness)
 		SHADER_PARAMETER(float, RayLength)
 		SHADER_PARAMETER(float, Intensity)
-		SHADER_PARAMETER(int, DebugMode)
+		//SHADER_PARAMETER(int, DebugMode)
 		SHADER_PARAMETER(int, FrameIndex)
 	
 		// Output
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGI_Raw_Output)
 
 		// Manual View Data (Fixed for consistency)
-		SHADER_PARAMETER(FVector4f, ManualViewRectMin)
-		SHADER_PARAMETER(FVector4f, ManualViewSizeAndInvSize)
-		SHADER_PARAMETER(FVector4f, ManualBufferSizeAndInvSize)
-		SHADER_PARAMETER(FMatrix44f, ManualSVPositionToTranslatedWorld)
-		SHADER_PARAMETER(FMatrix44f, ManualTranslatedWorldToClip)
+		SHADER_PARAMETER(FVector4f, ViewRectMin)
+		SHADER_PARAMETER(FVector4f, ViewSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, BufferSizeAndInvSize)
+		SHADER_PARAMETER(FMatrix44f, SVPositionToTranslatedWorld)
+		SHADER_PARAMETER(FMatrix44f, TranslatedWorldToClip)
 	
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 	END_SHADER_PARAMETER_STRUCT()
@@ -111,8 +106,9 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGIResultTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
-		SHADER_PARAMETER(FVector2f, ViewportSize)
-		SHADER_PARAMETER(int, DebugMode)
+		SHADER_PARAMETER(FVector4f, ViewSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, BufferSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, ViewRectMin)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
@@ -134,7 +130,10 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GBufferATexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGIDenoiseOutput)
-		SHADER_PARAMETER(FVector4f, ViewportSize)
+		SHADER_PARAMETER(FVector4f, ViewSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, BufferSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, ViewRectMin)
+		SHADER_PARAMETER(float, Intensity)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
@@ -156,7 +155,9 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HistoryTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VelocityTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
-		SHADER_PARAMETER(FVector4f, ViewportSize)
+		SHADER_PARAMETER(FVector4f, ViewSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, BufferSizeAndInvSize)
+		SHADER_PARAMETER(FVector4f, ViewRectMin)
 		SHADER_PARAMETER(float, HistoryWeight)
 		SHADER_PARAMETER_SAMPLER(SamplerState, BilinearSampler)
 	END_SHADER_PARAMETER_STRUCT()

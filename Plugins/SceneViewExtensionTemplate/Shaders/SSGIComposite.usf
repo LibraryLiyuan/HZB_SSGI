@@ -5,28 +5,29 @@
 Texture2D SceneColorTexture;
 Texture2D SSGIResultTexture;
 RWTexture2D<float4> OutputTexture;
-float2 ViewportSize;
-int DebugMode; // [新增]
+
+float4 ViewSizeAndInvSize;
+float4 BufferSizeAndInvSize;
+float4 ViewRectMin;
 
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
 void CompositeCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
 	uint2 PixelPos = DispatchThreadID.xy;
-	if (any(PixelPos >= uint2(ViewportSize))) return;
-    
-	float2 UV = (float2(PixelPos) + 0.5) / ViewportSize;
-    
-	float4 SceneColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, UV, 0);
-	float4 SSGIColor = SSGIResultTexture.SampleLevel(GlobalBilinearClampedSampler, UV, 0);
-	if (DebugMode != 0)
-	{
-		// [调试模式] 直接覆盖，不混合！
-		// 这样你可以清楚地看到 SSGI 输出的 Heatmap 或 UV
-		OutputTexture[PixelPos] = SSGIColor;
-	}
-	else
-	{
-		// [正常模式] 叠加
-		OutputTexture[PixelPos] = SceneColor + SSGIColor;
-	}
+
+	// PixelPos 是 View 空间坐标
+	if (any(PixelPos >= uint2(ViewSizeAndInvSize.xy))) return;
+
+	// View-space UV: 用于采样 SSGIResultTexture（它是 ViewSize 大小）
+	float2 LocalUV = (float2(PixelPos) + 0.5) * ViewSizeAndInvSize.zw;
+
+	// Buffer-space UV: 用于采样 SceneColorTexture（它是 BufferSize 大小）
+	float2 GlobalPixelPos = float2(PixelPos) + ViewRectMin.xy;
+	float2 GlobalUV = (GlobalPixelPos + 0.5) * BufferSizeAndInvSize.zw;
+
+	float4 SceneColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, GlobalUV, 0);
+	float4 SSGIColor  = SSGIResultTexture.SampleLevel(GlobalBilinearClampedSampler, LocalUV, 0);
+
+	// 写回 Buffer 空间（防止把 View 空间结果写错位置）
+	OutputTexture[uint2(GlobalPixelPos)] = SceneColor + SSGIColor;
 }
