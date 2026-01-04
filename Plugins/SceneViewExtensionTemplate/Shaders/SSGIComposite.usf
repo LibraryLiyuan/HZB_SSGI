@@ -1,4 +1,4 @@
-﻿// [SSGIComposite.usf]
+﻿// SSGIComposite.usf
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
 
@@ -15,19 +15,14 @@ void CompositeCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
 	uint2 PixelPos = DispatchThreadID.xy;
 
-	// PixelPos 是 View 空间坐标
 	if (any(PixelPos >= uint2(ViewSizeAndInvSize.xy))) return;
 
-	// View-space UV: 用于采样 SSGIResultTexture（它是 ViewSize 大小）
 	float2 LocalUV = (float2(PixelPos) + 0.5) * ViewSizeAndInvSize.zw;
 
-	// Buffer-space UV: 用于采样 SceneColorTexture（它是 BufferSize 大小）
 	float2 GlobalPixelPos = float2(PixelPos) + ViewRectMin.xy;
 	float2 GlobalUV = (GlobalPixelPos + 0.5) * BufferSizeAndInvSize.zw;
 
 	float4 SceneColor = SceneColorTexture.SampleLevel(GlobalBilinearClampedSampler, GlobalUV, 0);
-	float4 SSGIColor  = SSGIResultTexture.SampleLevel(GlobalBilinearClampedSampler, LocalUV, 0);
-
-	// 写回 Buffer 空间（防止把 View 空间结果写错位置）
-	OutputTexture[uint2(GlobalPixelPos)] = SceneColor + SSGIColor;
+	float4 SSGIColor = SSGIResultTexture.SampleLevel(GlobalPointClampedSampler, LocalUV, 0);
+	OutputTexture[PixelPos] = SceneColor + SSGIColor;
 }

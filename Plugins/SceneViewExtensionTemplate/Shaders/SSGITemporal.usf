@@ -1,57 +1,20 @@
-﻿// [SSGITemporal.usf] - YCoCg 空间优化版 (工业级 SSGI 降噪)
-// -----------------------------------------------------------------------------
+﻿// SSGITemporal.usf
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
 
-// -----------------------------------------------------------------------------
-// [输入纹理]
-// -----------------------------------------------------------------------------
-// 当前帧输入：已经过 Spatial Denoiser (空间降噪) 处理的图像
-Texture2D CurrentFrameTexture;  
+Texture2D CurrentFrameTexture;
+Texture2D HistoryTexture;
+Texture2D VelocityTexture;
+Texture2D SceneDepthTexture;
 
-// 历史帧输入：上一帧的最终输出结果
-// RGB 通道存储颜色，Alpha 通道存储“历史累积权重” (Accumulation Count)
-Texture2D HistoryTexture;       
-
-// 速度矢量：GBuffer Velocity，用于计算重投影坐标 (Reprojection UV)
-Texture2D VelocityTexture;      
-
-// 场景深度：(可选) 用于进行深度一致性检查，防止遮挡关系变化导致的错误重投影
-// 目前代码中主要依赖 Velocity 和 Color Clamping，深度检查略去以节省性能
-Texture2D SceneDepthTexture;    
-
-// -----------------------------------------------------------------------------
-// [输出]
-// -----------------------------------------------------------------------------
 RWTexture2D<float4> OutputTexture;
 
-// -----------------------------------------------------------------------------
-// [参数]
-// -----------------------------------------------------------------------------
-// 视口尺寸参数 (Local UV 计算用)
-float4 ViewSizeAndInvSize;   // xy=Width, Height; zw=1/Width, 1/Height
-
-// 全局缓冲尺寸参数 (Global UV 计算用)
-float4 BufferSizeAndInvSize; // xy=Width, Height; zw=1/Width, 1/Height
-
-// 视口偏移 (Global UV 计算用)
-float4 ViewRectMin;          
-
-// 历史混合基础权重 (本代码主要使用动态 Alpha，此参数作为备用/调试)
-float HistoryWeight;         
-
-// 双线性采样器：用于采样历史帧 (因为历史帧的 UV 通常不是整数像素)
+float4 ViewSizeAndInvSize;
+float4 BufferSizeAndInvSize;
+float4 ViewRectMin;
+float HistoryWeight;
 SamplerState BilinearSampler;
 
-// -----------------------------------------------------------------------------
-// [辅助函数] 色彩空间转换
-// -----------------------------------------------------------------------------
-
-// RGB -> YCoCg
-// Y:  亮度 (Luma)
-// Co: 橙色-青色偏差 (Chroma Orange)
-// Cg: 绿色-品红偏差 (Chroma Green)
-// 这种变换是可逆的，且比 RGB 更适合做统计分析
 float3 RGBToYCoCg(float3 RGB)
 {
     float Y  = dot(RGB, float3( 0.25, 0.50,  0.25));
@@ -60,8 +23,6 @@ float3 RGBToYCoCg(float3 RGB)
     return float3(Y, Co, Cg);
 }
 
-// YCoCg -> RGB
-// 逆变换
 float3 YCoCgToRGB(float3 YCoCg)
 {
     float Y  = YCoCg.x;
@@ -73,82 +34,44 @@ float3 YCoCgToRGB(float3 YCoCg)
     return float3(R, G, B);
 }
 
-// [ToneMapping]
-// 简易 Reinhard 操作符：将 HDR 亮度 (0 ~ 100+) 压缩到 LDR 范围 (0 ~ 1)
-// 目的：防止极亮的像素 (Firefly) 导致邻域方差 (Variance) 爆炸。
-// 如果方差过大，Clamping 范围就会变得极宽，导致历史帧的错误颜色无法被剔除，产生鬼影。
 float3 Tonemap(float3 x) 
 { 
     float Luma = Luminance(x);
-    // x / (1 + x) 曲线，将无穷大映射为 1
     return x / (1.0 + Luma); 
 }
 
-// [Inverse ToneMapping]
-// 逆操作：将处理完的 LDR 颜色还原回 HDR 线性空间
 float3 InverseTonemap(float3 x) 
 { 
     float Luma = Luminance(x);
-    // 加上 max(1e-4) 防止除零错误
     return x / max(1e-4, 1.0 - Luma); 
 }
 
-// -----------------------------------------------------------------------------
-// [Compute Shader 主函数]
-// -----------------------------------------------------------------------------
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
 void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 {
     uint2 PixelPos = DispatchThreadID.xy;
     if (any(PixelPos >= uint2(ViewSizeAndInvSize.xy))) return;
 
-    // -------------------------------------------------------------------------
-    // 1. 坐标系准备
-    // -------------------------------------------------------------------------
-    // Local UV: 当前视口的 UV (0~1)
     float2 LocalUV = (float2(PixelPos) + 0.5) * ViewSizeAndInvSize.zw;
-    
-    // Global UV: 全局缓冲的 UV (用于采样 Velocity)
     float2 GlobalPixelPos = float2(PixelPos) + ViewRectMin.xy;
     float2 GlobalUV = (GlobalPixelPos + 0.5) * BufferSizeAndInvSize.zw;
 
-    // -------------------------------------------------------------------------
-    // 2. 读取当前帧数据
-    // -------------------------------------------------------------------------
     float4 CurrentSample = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, LocalUV, 0);
     float3 CurrentColorRGB = CurrentSample.rgb;
-
-    // -------------------------------------------------------------------------
-    // 3. 计算重投影 (Reprojection)
-    // -------------------------------------------------------------------------
-    // 读取速度矢量 (Motion Vector)。注意：UE5 Velocity 通常包含相机运动和物体运动。
+    
     float4 VelocitySample = VelocityTexture.SampleLevel(GlobalPointClampedSampler, GlobalUV, 0);
     float2 Velocity = VelocitySample.xy;
     
-    // [非法速度过滤]
-    // 有时天空盒或特定物体会产生极大的错误速度，导致 UV 采样错乱。
-    // 如果速度超过屏幕尺寸的 10%，通常是不合理的，直接视为静止。
     if (max(abs(Velocity.x), abs(Velocity.y)) > 0.1) Velocity = 0; 
 
-    // 计算上一帧的 UV 位置
     float2 PrevLocalUV = LocalUV - Velocity;
 
-    // -------------------------------------------------------------------------
-    // 4. 历史帧有效性检查
-    // -------------------------------------------------------------------------
-    // 检查上一帧 UV 是否跑出了屏幕范围
+
     bool bOffScreen = any(PrevLocalUV < 0.0) || any(PrevLocalUV > 1.0);
 
-    // -------------------------------------------------------------------------
-    // 5. 邻域统计 (Neighborhood Statistics)
-    // 核心算法：计算当前像素周围 5x5 区域的颜色分布 (Mean & Variance)
-    // -------------------------------------------------------------------------
+    float3 m1 = 0;
+    float3 m2 = 0;
     
-    float3 m1 = 0; // 一阶矩 (Sum of Colors) -> 用于计算 Mean
-    float3 m2 = 0; // 二阶矩 (Sum of Colors^2) -> 用于计算 Variance
-    
-    // 使用 5x5 (Radius=2) 窗口
-    // 相比 3x3，5x5 能提供更稳定的统计信息，减少画面抖动 (Boiling Artifacts)
     const int KernelRadius = 2;
     float WeightSum = 0;
 
@@ -158,14 +81,10 @@ void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
         {
             float2 SampleUV = LocalUV + float2(x, y) * ViewSizeAndInvSize.zw;
             
-            // 采样越界保护
             if(any(SampleUV < 0) || any(SampleUV > 1)) continue;
 
             float3 SampleRGB = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0).rgb;
             
-            // [关键流程] RGB -> ToneMap -> YCoCg
-            // 我们不在线性 RGB 空间做统计，而是在“压缩亮度后的 YCoCg 空间”做统计。
-            // 这样能构建出一个更符合人眼感知的、对高光不敏感的包围盒。
             float3 SampleTM = Tonemap(SampleRGB);
             float3 SampleYCoCg = RGBToYCoCg(SampleTM);
             
@@ -175,91 +94,52 @@ void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
         }
     }
 
-    // 计算均值 (Mean)
     float3 Mean = m1 / WeightSum;
-    // 计算标准差 (Sigma = sqrt(E[x^2] - E[x]^2))
     float3 Sigma = sqrt(abs(m2 / WeightSum - Mean * Mean));
 
-    // [参数调整] Gamma (包围盒大小)
-    // Gamma = 2.0 是经验值。
-    // Gamma 过大 -> 包围盒太大 -> 容忍了历史帧的错误 -> 鬼影 (Ghosting)
-    // Gamma 过小 -> 包围盒太小 -> 拒绝了历史帧的有效细节 -> 闪烁/噪点 (Noise/Flickering)
     float Gamma = 2.0; 
     
-    // 构建 AABB 包围盒 (Min/Max)
     float3 MinYCoCg = Mean - Gamma * Sigma;
     float3 MaxYCoCg = Mean + Gamma * Sigma;
 
-    // -------------------------------------------------------------------------
-    // 6. 读取并修正历史帧 (History Rectification)
-    // -------------------------------------------------------------------------
-    
-    float3 HistoryColorRGB = CurrentColorRGB; // 默认值 (如果历史无效，退化为当前帧)
+    float3 HistoryColorRGB = CurrentColorRGB;
     float HistoryAccumulationCount = 0.0;
-    bool bHistoryValid = !bOffScreen; // 只要没出屏幕，暂时认为有效
+    bool bHistoryValid = !bOffScreen;
 
     if (bHistoryValid)
     {
-        // 采样历史帧 (必须用双线性插值，因为 UV 是浮点数)
         float4 HistoryRead = HistoryTexture.SampleLevel(BilinearSampler, PrevLocalUV, 0);
         float3 RawHistoryRGB = HistoryRead.rgb;
         HistoryAccumulationCount = HistoryRead.a;
 
-        // [关键流程] 历史帧变换：RGB -> ToneMap -> YCoCg
         float3 RawHistoryTM = Tonemap(RawHistoryRGB);
         float3 RawHistoryYCoCg = RGBToYCoCg(RawHistoryTM);
         
-        // [核心操作] Box Clipping (色彩裁剪)
-        // 将历史颜色强制拉回到当前帧邻域的 AABB 范围内。
-        // 如果历史颜色在包围盒外，说明它和当前帧差异太大（可能是物体移动了），直接切除。
         float3 ClampedHistoryYCoCg = clamp(RawHistoryYCoCg, MinYCoCg, MaxYCoCg);
         
-        // [关键流程] 逆变换：YCoCg -> RGB -> InverseToneMap
-        // 将修正后的颜色还原回线性 RGB 空间
         float3 ClampedHistoryTM = YCoCgToRGB(ClampedHistoryYCoCg);
         HistoryColorRGB = InverseTonemap(ClampedHistoryTM);
     }
 
-    // -------------------------------------------------------------------------
-    // 7. 动态权重计算 (Accumulation Factor)
-    // -------------------------------------------------------------------------
-    
     if (!bHistoryValid)
     {
-        HistoryAccumulationCount = 0.0; // 历史无效，重置计数器
+        HistoryAccumulationCount = 0.0;
     }
 
-    // 累积计数器 +1
     float CurrentAccumulationCount = HistoryAccumulationCount + 1.0;
-    
-    // 限制最大累积帧数
-    // 32 帧约等于 0.5 秒 (60FPS)。这意味着我们利用过去 32 帧的信息来平滑当前帧。
-    float MaxAccumulation = 32.0; 
+    float MaxAccumulation = 32.0;
     CurrentAccumulationCount = min(CurrentAccumulationCount, MaxAccumulation);
 
-    // 计算混合权重 Alpha
-    // 这是一个指数移动平均 (EMA) 的变种。
-    // 刚开始几帧 (Count 小) 时，Alpha 大，快速由噪点图收敛到平滑图。
-    // 稳定后 (Count=32)，Alpha=1/32，保持高强度的平滑。
     float CurrentAlpha = 1.0 / CurrentAccumulationCount;
 
-    // -------------------------------------------------------------------------
-    // 8. 最终混合 (Blending)
-    // -------------------------------------------------------------------------
-    
-    // 注意：混合必须在 Linear RGB 空间进行，保证物理上的能量守恒
-    // Final = History * (1 - Alpha) + Current * Alpha
     float3 FinalColor = lerp(HistoryColorRGB, CurrentColorRGB, CurrentAlpha);
     
-    // 防止负数 (色彩空间转换可能会引入微小的负值误差)
     FinalColor = max(FinalColor, 0.0);
     
-    // NaN 保护 (防止数值爆炸导致的黑/白坏点)
     if (any(isnan(FinalColor)) || any(isinf(FinalColor)))
     {
         FinalColor = CurrentColorRGB;
     }
 
-    // 输出结果 (RGB = 降噪后的颜色, A = 更新后的累积计数)
     OutputTexture[PixelPos] = float4(FinalColor, CurrentAccumulationCount);
 }
