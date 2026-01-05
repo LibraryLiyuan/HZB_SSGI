@@ -283,11 +283,5 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		FIntVector GroupCount(FMath::DivideAndRoundUp(ViewSize.X, 8), FMath::DivideAndRoundUp(ViewSize.Y, 8), 1);
         FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("SSGI Composite"), ComputeShader, PassParameters, GroupCount);
 	}
-
-	FRHICopyTextureInfo CopyInfo;
-	CopyInfo.Size = FIntVector(ViewSize.X, ViewSize.Y, 1);
-	CopyInfo.SourcePosition = FIntVector(0, 0, 0);
-	CopyInfo.DestPosition = FIntVector(ViewRect.Min.X, ViewRect.Min.Y, 0);
-	AddCopyTexturePass(GraphBuilder, OutputTexture, SceneColor.Texture, CopyInfo);
-	return SceneColor;
+	return FScreenPassTexture(OutputTexture, FIntRect(0, 0, ViewSize.X, ViewSize.Y));
 }
