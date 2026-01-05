@@ -18,7 +18,6 @@ private:
 	TRefCountPtr<IPooledRenderTarget> HistoryRenderTarget;
 };
 
-// HZB Mipmap Generation Shader
 class SCENEVIEWEXTENSIONTEMPLATE_API FHZBBuildCS : public FGlobalShader
 {
 public:
@@ -46,7 +45,6 @@ public:
 	}
 };
 
-// Main SSGI Shader
 class SCENEVIEWEXTENSIONTEMPLATE_API FSSGICS : public FGlobalShader
 {
 public:
@@ -61,6 +59,8 @@ public:
 		
 		// GBuffer Textures
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferA)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferB)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSGI_GBufferC)
 
 		// Settings
 		SHADER_PARAMETER(FVector4f, HZBSize)
@@ -75,7 +75,6 @@ public:
 		// Output
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SSGI_Raw_Output)
 
-		// Manual View Data (Fixed for consistency)
 		SHADER_PARAMETER(FVector4f, ViewRectMin)
 		SHADER_PARAMETER(FVector4f, ViewSizeAndInvSize)
 		SHADER_PARAMETER(FVector4f, BufferSizeAndInvSize)

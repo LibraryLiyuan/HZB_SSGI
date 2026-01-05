@@ -10,6 +10,9 @@ Texture2D SceneColorTexture;
 Texture2D InputSceneDepthTexture;
 // GBuffer的World Normal
 Texture2D SSGI_GBufferA;
+// Color
+Texture2D SSGI_GBufferB;
+Texture2D SSGI_GBufferC;
 
 float4 HZBSize;
 int MaxMipLevel;
@@ -220,7 +223,11 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
             }
         }
     }
-    float3 FinalColor = (ValidSamples > 0.0) ? (AccumulatedColor / float(NumSamples)) : float3(0,0,0);
-    
-    SSGI_Raw_Output[PixelPos] = float4(FinalColor * Intensity, 1.0);
+    float3 BaseColor = SSGI_GBufferC.SampleLevel(GlobalPointClampedSampler, BufferUV, 0).rgb;
+    float3 FinalGI = ((ValidSamples > 0.0) ? (AccumulatedColor / float(NumSamples)) : float3(0,0,0)) * BaseColor;
+    // 加上AO的遮蔽效果
+    float AmbientOcclusion = SSGI_GBufferB.SampleLevel(GlobalPointClampedSampler, BufferUV, 0).a;
+    FinalGI *= AmbientOcclusion;
+
+    SSGI_Raw_Output[PixelPos] = float4(FinalGI * Intensity, 1.0);
 }

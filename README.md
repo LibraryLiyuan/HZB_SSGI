@@ -10,3 +10,7 @@
 - [x] Temporal累积
 - [ ] A-Trous Wavelet 加速单帧降噪
 - [ ] DLC：实现HZB_SSR
+
+## 效果展示
+
+> 1SPP, 已经关闭场景里面的Luman GI和Luman Reflection

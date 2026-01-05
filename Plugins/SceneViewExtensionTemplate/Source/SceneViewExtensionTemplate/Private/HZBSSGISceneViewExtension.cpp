@@ -138,6 +138,8 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		FRDGTextureRef Dummy = GSystemTextures.GetBlackDummy(GraphBuilder);
 		auto& StParams = SceneTexturesParams->GetParameters();
 		PassParameters->SSGI_GBufferA = StParams->GBufferATexture ? StParams->GBufferATexture : Dummy;
+		PassParameters->SSGI_GBufferB = StParams->GBufferBTexture ? StParams->GBufferBTexture : Dummy;
+		PassParameters->SSGI_GBufferC = StParams->GBufferCTexture ? StParams->GBufferCTexture : Dummy;
 
 		PassParameters->HZBSize = FVector4f(HZBTexture->Desc.Extent.X, HZBTexture->Desc.Extent.Y, 1.0f / HZBTexture->Desc.Extent.X, 1.0f / HZBTexture->Desc.Extent.Y);
 		PassParameters->MaxMipLevel = NumMips - 1;
