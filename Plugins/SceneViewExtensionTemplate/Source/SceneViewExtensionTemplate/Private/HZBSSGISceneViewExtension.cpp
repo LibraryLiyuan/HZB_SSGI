@@ -37,7 +37,9 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 	{
 		return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
 	}
-
+	/**
+	 * HZB Pass
+	 */
 	const FSceneTextureShaderParameters& SceneTextures = Inputs.SceneTextures;
 	FRDGTextureRef SceneDepth = nullptr;
 
@@ -51,14 +53,13 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		auto* UniformBuffer = SceneTextures.MobileSceneTextures.GetUniformBuffer();
 		if (UniformBuffer) SceneDepth = UniformBuffer->GetParameters()->SceneDepthTexture;
 	}
-
 	if (!SceneDepth)
 	{
 		return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
 	}
-
+	
 	RDG_EVENT_SCOPE(GraphBuilder, "HZBSSGI");
-
+	// Buffer尺寸的Depth
 	auto SceneSize = SceneDepth->Desc.Extent;
 	int32 NumMips = FMath::FloorLog2(FMath::Max(SceneSize.X, SceneSize.Y)) + 1;
 
@@ -68,7 +69,7 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 	);
 	HZBDesc.NumMips = NumMips;
 	FRDGTextureRef HZBTexture = GraphBuilder.CreateTexture(HZBDesc, TEXT("HZB Texture"));
-
+	// 生成 Mip 0 (直接拷贝 SceneDepth)
 	FScreenPassTexture SceneDepthInput(SceneDepth);
 	FScreenPassRenderTarget HZBMip0(HZBTexture, ERenderTargetLoadAction::ENoAction);
 	AddDrawTexturePass(GraphBuilder, View, SceneDepthInput, HZBMip0);
@@ -81,47 +82,44 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		NextOutputSize.Y = FMath::Max(1, CurrentInputSize.Y / 2);
 
 		FHZBBuildCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FHZBBuildCS::FParameters>();
+		// 上一级的SRV
 		PassParameters->InputDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(HZBTexture, MipLevel - 1));
 		PassParameters->InputViewportMaxBound = FVector2f(CurrentInputSize.X - 1, CurrentInputSize.Y - 1);
+		// 当前级的UAV
 		PassParameters->OutputDepthTexture = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(HZBTexture, MipLevel));
 		PassParameters->OutputViewportSize = FVector2f(NextOutputSize.X, NextOutputSize.Y);
 
 		TShaderMapRef<FHZBBuildCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		// 由于使用的是Buffer尺寸，所以GroupCount也需要传入的是Buffer尺寸的
 		FIntVector GroupCount(FMath::DivideAndRoundUp(NextOutputSize.X, 8), FMath::DivideAndRoundUp(NextOutputSize.Y, 8), 1);
 
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("HZB Mip%d", MipLevel), ComputeShader, PassParameters, GroupCount);
 		CurrentInputSize = NextOutputSize;
 	}
 
-	
 	/**
 	 * SSGI Trace Pass
 	 */
 	float SSGIIntensity = 1.0f;
 	FScreenPassTextureSlice SceneColorSlice = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
 	if (!SceneColorSlice.IsValid()) return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
-	
+	// Buffer的大小和View的坐标映射
 	FIntRect ViewRect = SceneColorSlice.ViewRect;
 	FIntPoint ViewSize = ViewRect.Size();
 	FIntPoint BufferSize = SceneDepth->Desc.Extent;
-
 	ensure(ViewSize.X <= BufferSize.X && ViewSize.Y <= BufferSize.Y);
-
 	FVector4f CommonViewRectMin = FVector4f(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, 0.0f);
-
 	FVector4f CommonViewSizeAndInvSize = FVector4f(
 		ViewSize.X, ViewSize.Y, 
 		1.0f / ViewSize.X, 1.0f / ViewSize.Y
 	);
-
 	FVector4f CommonBufferSizeAndInvSize = FVector4f(
 		BufferSize.X, BufferSize.Y, 
 		1.0f / BufferSize.X, 1.0f / BufferSize.Y
 	);
-
 	FMatrix44f MatSVPosToWorld = FMatrix44f(View.ViewMatrices.GetInvTranslatedViewProjectionMatrix());
 	FMatrix44f MatWorldToClip = FMatrix44f(View.ViewMatrices.GetTranslatedViewProjectionMatrix());
-
+	
 	FRDGTextureDesc SSGIOutputDesc = FRDGTextureDesc::Create2D(
 		ViewSize,
 		PF_FloatRGBA, FClearValueBinding::Black,
@@ -140,12 +138,6 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		FRDGTextureRef Dummy = GSystemTextures.GetBlackDummy(GraphBuilder);
 		auto& StParams = SceneTexturesParams->GetParameters();
 		PassParameters->SSGI_GBufferA = StParams->GBufferATexture ? StParams->GBufferATexture : Dummy;
-		PassParameters->SSGI_GBufferB = StParams->GBufferBTexture ? StParams->GBufferBTexture : Dummy;
-		PassParameters->SSGI_GBufferC = StParams->GBufferCTexture ? StParams->GBufferCTexture : Dummy;
-		PassParameters->SSGI_GBufferD = StParams->GBufferDTexture ? StParams->GBufferDTexture : Dummy;
-		PassParameters->SSGI_GBufferE = StParams->GBufferETexture ? StParams->GBufferETexture : Dummy;
-		PassParameters->SSGI_GBufferF = StParams->GBufferFTexture ? StParams->GBufferFTexture : Dummy;
-		PassParameters->SSGI_GBufferVelocity = StParams->GBufferVelocityTexture ? StParams->GBufferVelocityTexture : Dummy;
 
 		PassParameters->HZBSize = FVector4f(HZBTexture->Desc.Extent.X, HZBTexture->Desc.Extent.Y, 1.0f / HZBTexture->Desc.Extent.X, 1.0f / HZBTexture->Desc.Extent.Y);
 		PassParameters->MaxMipLevel = NumMips - 1;
@@ -153,6 +145,7 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		PassParameters->Thickness = 10.0f;
 		PassParameters->RayLength = 100.0f;
 		PassParameters->Intensity = SSGIIntensity;
+		// 针对后续的Temporal Pass添加的FrameIndex 用于产生随机噪点种子
 		uint32 FrameIndex = View.Family->FrameNumber % 1024; 
 		PassParameters->FrameIndex = (int)FrameIndex;
 		
@@ -165,14 +158,16 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
         
 		PassParameters->SVPositionToTranslatedWorld = MatSVPosToWorld;
 		PassParameters->TranslatedWorldToClip = MatWorldToClip;
-
+		// 由于使用的是View尺寸，所以GroupCount也需要传入的是View尺寸的
 		FIntVector GroupCount(FMath::DivideAndRoundUp(ViewSize.X, 8), FMath::DivideAndRoundUp(ViewSize.Y, 8), 1);
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("SSGI Trace"), ComputeShader, PassParameters, GroupCount);
 	}
-	
+
+	/**
+	 * Denoise Pass
+	 */
     FRDGTextureDesc DenoiseDesc = SSGIOutputTexture->Desc;
     FRDGTextureRef DenoisedTexture = GraphBuilder.CreateTexture(DenoiseDesc, TEXT("SSGI_Denoised"));
-
     {
         TShaderMapRef<FSSGIDenoiserCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         FSSGIDenoiserCS::FParameters* DenoiserParams = GraphBuilder.AllocParameters<FSSGIDenoiserCS::FParameters>();
@@ -193,7 +188,10 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		FIntVector GroupCount(FMath::DivideAndRoundUp(ViewSize.X, 8), FMath::DivideAndRoundUp(ViewSize.Y, 8), 1);
         FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("SSGI Spatial Denoise"), ComputeShader, DenoiserParams, GroupCount);
     }
-
+	
+	/**
+	 * Temporal Pass
+	 */
     FRDGTextureRef TemporalOutputTexture = nullptr;
     {
         FRDGTextureRef HistoryTextureRef = nullptr;
@@ -201,6 +199,7 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
         
 		FIntPoint CurrentViewSize = ViewSize;
         bool bSizeChanged = false;
+		// 处理是否是第一帧
         if (!bIsFirstFrame)
         {
             FIntPoint HistorySize = HistoryRenderTarget->GetDesc().Extent;
@@ -228,7 +227,7 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 
         PassParameters->CurrentFrameTexture = DenoisedTexture; 
         PassParameters->HistoryTexture = HistoryTextureRef;
-        
+        // 获取GBuffer里面存储的速度向量图
         auto& StParams = SceneTexturesParams->GetParameters();
         PassParameters->VelocityTexture = StParams->GBufferVelocityTexture ? StParams->GBufferVelocityTexture : GSystemTextures.GetBlackDummy(GraphBuilder);
         
@@ -237,7 +236,8 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		PassParameters->ViewSizeAndInvSize = CommonViewSizeAndInvSize;
 		PassParameters->BufferSizeAndInvSize = CommonBufferSizeAndInvSize;
 		PassParameters->ViewRectMin = CommonViewRectMin;
-        PassParameters->HistoryWeight = (bIsFirstFrame || bSizeChanged) ? 0.0f : 0.9f; 
+        PassParameters->HistoryWeight = (bIsFirstFrame || bSizeChanged) ? 0.0f : 0.9f;
+		// 使用双边插值采样，保证平滑
         PassParameters->BilinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
 		FIntVector GroupCount(FMath::DivideAndRoundUp(ViewSize.X, 8), FMath::DivideAndRoundUp(ViewSize.Y, 8), 1);
@@ -263,12 +263,12 @@ FScreenPassTexture FHZBSSGISceneViewExtension::HZBSSGIProcessPass(FRDGBuilder& G
 		FRDGTextureRef SelectedTexture = TemporalOutputTexture;
 		if (CurrentDebugMode == 1)
 		{
-			// 查看 Raw Trace 结果 (未降噪)
+			// 查看SSGI Pass的结果
 			SelectedTexture = SSGIOutputTexture;
 		}
 		else if (CurrentDebugMode == 2)
 		{
-			// 查看 Spatial Denoise 结果 (单帧降噪)
+			// 查看Denoise Pass的结果
 			SelectedTexture = DenoisedTexture;
 		}
 		

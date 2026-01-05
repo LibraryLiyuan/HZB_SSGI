@@ -8,14 +8,8 @@
 Texture2D HZBTexture;
 Texture2D SceneColorTexture;
 Texture2D InputSceneDepthTexture;
-
+// GBuffer的World Normal
 Texture2D SSGI_GBufferA;
-Texture2D SSGI_GBufferB;
-Texture2D SSGI_GBufferC;
-Texture2D SSGI_GBufferD;
-Texture2D SSGI_GBufferE;
-Texture2D SSGI_GBufferF;
-Texture2D SSGI_GBufferVelocity;
 
 float4 HZBSize;
 int MaxMipLevel;
@@ -23,11 +17,13 @@ int MaxIterations;
 float Thickness;
 float RayLength;
 float Intensity;
+//int DebugMode;
 int FrameIndex;
 
 float4 ViewRectMin;
 float4 ViewSizeAndInvSize;
 float4 BufferSizeAndInvSize;
+
 float4x4 SVPositionToTranslatedWorld;
 float4x4 TranslatedWorldToClip;
 
@@ -42,7 +38,7 @@ uint Hash(uint x)
     x = (x >> 16) ^ x;
     return x;
 }
-
+// 随机状态，引入FrameIndex，进行时间差异
 void RandInit(uint2 PixelPos, uint FrameIndex, uint Seed)
 {
     uint CombinedSeed = PixelPos.x + (PixelPos.y << 16);
@@ -70,6 +66,8 @@ float3 GetHeatmapColor(float Value)
     return Color;
 }
 
+// UE的GBuffer的深度只存了二维分量
+// 八面体解码
 float3 CustomOctahedralDecode(float2 Oct)
 {
     Oct = Oct * 2.0 - 1.0;
@@ -143,8 +141,11 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
     {
         RandInit(PixelPos, FrameIndex, i);
         float2 RandE = float2(Rand(), Rand());
-        
+        // 生成光线，余弦加权采样
+        // sqrt(RanE.y)
         float3 LocalRayDir = CosineSampleHemisphere(RandE).xyz;
+        // 光线：像素局部空间->世界空间->屏幕空间
+        // TBN 矩阵
         float3x3 TangentToWorld = GetTangentBasis(WorldNormal);
         float3 WorldRayDir = mul(LocalRayDir, TangentToWorld);
         float3 WorldRayEnd = BiasedWorldPos + WorldRayDir * RayLength;
@@ -162,11 +163,13 @@ void SSGICS(uint3 DispatchThreadID : SV_DispatchThreadID)
         
         if (ClipStart.w < 1e-4) continue;
 
+        // 使用Buffer尺寸生成光线，然后使用View进行边界检测
+        // 透视除法
         float3 ViewportStart = ClipStart.xyz / ClipStart.w;
         float3 ViewportEnd   = ClipEnd.xyz / ClipEnd.w;
         ViewportStart.xy = ViewportStart.xy * float2(0.5, -0.5) + 0.5;
         ViewportEnd.xy   = ViewportEnd.xy   * float2(0.5, -0.5) + 0.5;
-
+        // View到Buffer的尺寸变换
         float2 UVScale = ViewSizeAndInvSize.xy * BufferSizeAndInvSize.zw;
         float2 UVOffset = ViewRectMin.xy * BufferSizeAndInvSize.zw;
 

@@ -34,6 +34,7 @@ float3 YCoCgToRGB(float3 YCoCg)
     return float3(R, G, B);
 }
 
+// 处理FireFly导致的方差计算问题
 float3 Tonemap(float3 x) 
 { 
     float Luma = Luminance(x);
@@ -58,17 +59,16 @@ void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 
     float4 CurrentSample = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, LocalUV, 0);
     float3 CurrentColorRGB = CurrentSample.rgb;
-    
+    // 读取Velocity
     float4 VelocitySample = VelocityTexture.SampleLevel(GlobalPointClampedSampler, GlobalUV, 0);
     float2 Velocity = VelocitySample.xy;
     
     if (max(abs(Velocity.x), abs(Velocity.y)) > 0.1) Velocity = 0; 
-
+    // 计算上一帧的位置
     float2 PrevLocalUV = LocalUV - Velocity;
 
-
     bool bOffScreen = any(PrevLocalUV < 0.0) || any(PrevLocalUV > 1.0);
-
+    // 均值和二阶均值
     float3 m1 = 0;
     float3 m2 = 0;
     
@@ -80,11 +80,9 @@ void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
         for(int y = -KernelRadius; y <= KernelRadius; y++)
         {
             float2 SampleUV = LocalUV + float2(x, y) * ViewSizeAndInvSize.zw;
-            
             if(any(SampleUV < 0) || any(SampleUV > 1)) continue;
-
-            float3 SampleRGB = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0).rgb;
             
+            float3 SampleRGB = CurrentFrameTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0).rgb;
             float3 SampleTM = Tonemap(SampleRGB);
             float3 SampleYCoCg = RGBToYCoCg(SampleTM);
             
@@ -93,7 +91,6 @@ void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
             WeightSum += 1.0;
         }
     }
-
     float3 Mean = m1 / WeightSum;
     float3 Sigma = sqrt(abs(m2 / WeightSum - Mean * Mean));
 
@@ -115,31 +112,26 @@ void TemporalCS(uint3 DispatchThreadID : SV_DispatchThreadID)
         float3 RawHistoryTM = Tonemap(RawHistoryRGB);
         float3 RawHistoryYCoCg = RGBToYCoCg(RawHistoryTM);
         
+        // 通过均值和方差确定的历史值的有效大小，进去clamp
         float3 ClampedHistoryYCoCg = clamp(RawHistoryYCoCg, MinYCoCg, MaxYCoCg);
-        
         float3 ClampedHistoryTM = YCoCgToRGB(ClampedHistoryYCoCg);
         HistoryColorRGB = InverseTonemap(ClampedHistoryTM);
     }
-
     if (!bHistoryValid)
     {
         HistoryAccumulationCount = 0.0;
     }
-
     float CurrentAccumulationCount = HistoryAccumulationCount + 1.0;
+    // 使用最大32帧进行平滑
     float MaxAccumulation = 32.0;
     CurrentAccumulationCount = min(CurrentAccumulationCount, MaxAccumulation);
-
     float CurrentAlpha = 1.0 / CurrentAccumulationCount;
-
     float3 FinalColor = lerp(HistoryColorRGB, CurrentColorRGB, CurrentAlpha);
-    
     FinalColor = max(FinalColor, 0.0);
-    
     if (any(isnan(FinalColor)) || any(isinf(FinalColor)))
     {
         FinalColor = CurrentColorRGB;
     }
-
+    // 通过A值传递累积计数
     OutputTexture[PixelPos] = float4(FinalColor, CurrentAccumulationCount);
 }

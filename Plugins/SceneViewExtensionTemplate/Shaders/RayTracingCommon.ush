@@ -12,6 +12,7 @@ struct FHiZTraceInput
 
 	int MaxMipLevel;
 	int MaxIterations;
+	// 假设像素厚度，处理光线穿透到物体后面的情况
 	float Thickness;
 
 	float2 ValidUVMin;
@@ -40,6 +41,7 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 	float3 CurrentPos = Input.RayOrigin;
 	float3 RayDir = Input.RayDirection;
 
+	// AABB求交
 	float3 InvRayDir;
 	InvRayDir.x = (abs(RayDir.x) < 1e-6) ? 1e6 : 1.0 / RayDir.x;
 	InvRayDir.y = (abs(RayDir.y) < 1e-6) ? 1e6 : 1.0 / RayDir.y;
@@ -55,18 +57,25 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 		float2 CellCount = GetCellCount(CurrentMip, Input.HZBSize);
 		float2 CellSize = 1.0 / CellCount;
 		float2 CellUV = (floor(CurrentPos.xy * CellCount) + 0.5) * CellSize;
-		
+		// UE 使用 Reverse-Z: 
+		// 1.0 (Near, 屏幕前) 0.0 (Far, 无穷远)
 		float HZB_DeviceZ = Input.HZBTexture.SampleLevel(GlobalPointClampedSampler, CellUV, CurrentMip).r;
+		// Z-fighting
 		const float DepthEpsilon = 0.0001;
 
 		if (CurrentPos.z < HZB_DeviceZ + DepthEpsilon) 
 		{
 			if (CurrentMip == 0)
 			{
+				// 将DeviceZ转化成线性的
+				/**
+				 * 由于非线性的DeviceZ会导致同样的Thickness在不同的远近代表的大小不一致，会导致比较的时候容易误判
+				 */
 				float Linear_HZB = ConvertFromDeviceZ(HZB_DeviceZ);
 				float Linear_Ray = ConvertFromDeviceZ(CurrentPos.z);
 				float DistDiff = Linear_Ray - Linear_HZB;
 
+				// 判断是不是穿透了
 				if (DistDiff > 0.0 && DistDiff < Input.Thickness)
 				{
 					Result.bHit = true;
@@ -87,6 +96,7 @@ FHiZTraceResult HiZTrace(FHiZTraceInput Input)
 		}
 
 		{
+			// AABB求交
 			float2 CurrentCellIdx = floor(CurrentPos.xy * CellCount);
 			float2 BoundaryUV = (CurrentCellIdx + float2(RayDir.x > 0 ? 1.0 : 0.0, RayDir.y > 0 ? 1.0 : 0.0)) * CellSize;
 			float2 T_Boundary = (BoundaryUV - CurrentPos.xy) * InvRayDir.xy;

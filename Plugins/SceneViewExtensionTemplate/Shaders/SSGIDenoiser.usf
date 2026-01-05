@@ -2,11 +2,9 @@
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
 
-
 Texture2D SSGIInputTexture;
 Texture2D SceneDepthTexture; 
 Texture2D GBufferATexture;
-
 
 RWTexture2D<float4> SSGIDenoiseOutput;
 
@@ -39,7 +37,7 @@ float SqrDistance(float3 A, float3 B)
     float3 Diff = A - B;
     return dot(Diff, Diff);
 }
-
+// 反余弦
 float SafeAcos(float x)
 {
     return acos(clamp(x, -1.0, 1.0));
@@ -60,12 +58,15 @@ void DenoiserCS(uint3 DispatchThreadID : SV_DispatchThreadID)
     float3 CenterColor = SSGIInputTexture.SampleLevel(GlobalPointClampedSampler, LocalUV, 0).rgb;
     float3 CenterNormal = GetWorldNormal(GlobalUV);
     float CenterDepth = GetLinearDepth(GlobalUV);
-    
-    float BaseSigmaColor = 0.8; 
+    // 颜色滤波
+    float BaseSigmaColor = 0.8;
+    // 使用SSGI强度进行平滑
     float AdaptiveSigmaColor = BaseSigmaColor * max(1.0, Intensity);
-    
-    float SigmaCoord = 32.0; 
-    float SigmaNormal = 0.3; 
+    // 距离滤波
+    float SigmaCoord = 32.0;
+    // 法线滤波
+    float SigmaNormal = 0.3;
+    // 深度滤波
     float SigmaPlane = 10.0;
 
     float3 SumColor = 0;
@@ -78,7 +79,6 @@ void DenoiserCS(uint3 DispatchThreadID : SV_DispatchThreadID)
         for (int y = -Radius; y <= Radius; y++)
         {
             float2 NeighborLocalUV = LocalUV + float2(x, y) * ViewSizeAndInvSize.zw;
-            
             float2 NeighborGlobalUV = GlobalUV + float2(x, y) * BufferSizeAndInvSize.zw;
 
             if (any(NeighborLocalUV < 0.0) || any(NeighborLocalUV > 1.0)) continue;
@@ -93,11 +93,11 @@ void DenoiserCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 
             float ColorDist2 = SqrDistance(CenterColor, NeighborColor);
             float D_Color = ColorDist2 / (2.0 * AdaptiveSigmaColor * AdaptiveSigmaColor);
-
+            // 针对FireFly进行处理
             float LumaCenter = LuminanceDenoise(CenterColor);
             float LumaNeighbor = LuminanceDenoise(NeighborColor);
             float FireflyWeight = 1.0 / (1.0 + max(0.0, LumaNeighbor - LumaCenter) / AdaptiveSigmaColor);
-
+            // 法线权重计算的时候，需要反算出角度。
             float NormalAngle = SafeAcos(dot(CenterNormal, NeighborNormal));
             float D_Normal = (NormalAngle * NormalAngle) / (2.0 * SigmaNormal * SigmaNormal);
 
